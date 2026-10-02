@@ -734,6 +734,36 @@ if plugins_options['mtk']
   }}
 endif
 
+# plugin: mtk-soc
+if plugins_options['mtk-soc']
+  plugins += {'plugin-mtk-soc': {
+    'plugin': true,
+    'module': {
+      'sources': files('mtk-soc/mm-plugin-mtk-soc.c',
+                       'mtk-soc/mm-broadband-modem-mtk-soc.c',
+                       'mtk-soc/mm-broadband-bearer-mtk-soc.c',
+                       'mtk-soc/mm-mtk-mipc.c',
+                       'mtk-soc/mm-mtk-ipsec.c'),
+      'include_directories': plugins_incs,
+      'c_args': '-DMM_MODULE_NAME="mtk-soc"',
+    },
+    'test': {
+      'sources': files('mtk-soc/test-mtk-mipc.c', 'mtk-soc/mm-mtk-mipc.c'),
+      'dependencies': dependency('glib-2.0'),
+    },
+  }}
+
+  plugins_udev_rules += files('mtk-soc/77-mm-mtk-soc.rules')
+
+  if enable_tests
+    test_mtk_ipsec = executable('test-mtk-ipsec',
+      files('mtk-soc/test-mtk-ipsec.c', 'mtk-soc/mm-mtk-ipsec.c', 'mtk-soc/mm-mtk-mipc.c'),
+      dependencies: glib_dep,
+    )
+    test('test-mtk-ipsec', test_mtk_ipsec)
+  endif
+endif
+
 # plugin: nokia
 if plugins_options['nokia']
   sources = files(

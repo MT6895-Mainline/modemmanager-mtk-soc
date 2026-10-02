@@ -4,3 +4,5 @@
 tags
 /.vscode
 /cscope.out
+/_standalone-tests/
+/_build*/

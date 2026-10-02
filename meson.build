@@ -346,6 +346,7 @@ plugins_options_reqs = {
   'motorola': {'available': true, 'shared': []},
   'mtk-legacy': {'available': true, 'shared': mtk_shared_reqs},
   'mtk': {'available': true, 'shared': mtk_shared_reqs},
+  'mtk-soc': {'available': true, 'shared': []},
   'netprisma': {'available': true, 'shared': ['quectel']},
   'nokia': {'available': true, 'shared': []},
   'nokia-icera': {'available': true, 'shared': ['icera']},

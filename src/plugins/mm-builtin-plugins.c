@@ -79,6 +79,9 @@ MMPlugin *mm_plugin_create_motorola (void);
 #if defined ENABLE_PLUGIN_MTK
 MMPlugin *mm_plugin_create_mtk (void);
 #endif
+#if defined ENABLE_PLUGIN_MTK_SOC
+MMPlugin *mm_plugin_create_mtk_soc (void);
+#endif
 #if defined ENABLE_PLUGIN_NOKIA
 MMPlugin *mm_plugin_create_nokia (void);
 #endif
@@ -216,6 +219,9 @@ mm_builtin_plugins_load (void)
 #endif
 #if defined ENABLE_PLUGIN_MTK
     PREPEND_PLUGIN (mtk);
+#endif
+#if defined ENABLE_PLUGIN_MTK_SOC
+    PREPEND_PLUGIN (mtk_soc);
 #endif
 #if defined ENABLE_PLUGIN_NOKIA
     PREPEND_PLUGIN (nokia);

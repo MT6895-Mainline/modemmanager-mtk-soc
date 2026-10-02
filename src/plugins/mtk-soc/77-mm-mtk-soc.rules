@@ -1,0 +1,14 @@
+# MediaTek SoC CCCI AT port and direct-IP data ports belong to one modem.
+ACTION!="add|change|move|bind", GOTO="mm_mtk_soc_end"
+
+SUBSYSTEM=="tty", KERNEL=="ttyCCCI0", DRIVERS=="ccci_tty", GOTO="mm_mtk_soc_process"
+SUBSYSTEM=="net", KERNEL=="ccmni[0-9]*", GOTO="mm_mtk_soc_process"
+GOTO="mm_mtk_soc_end"
+
+LABEL="mm_mtk_soc_process"
+ENV{ID_MM_MTK_SOC}="1"
+# ponytail: one MD per SoC; derive per-MD UID if a platform exposes multiple MDs.
+ENV{ID_MM_PHYSDEV_UID}="mtk-soc-ccci-md1"
+SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
+
+LABEL="mm_mtk_soc_end"

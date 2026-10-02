@@ -8,6 +8,11 @@ Copyright (C) 2011-2024 Aleksander Morgado <aleksander@aleksander.es>
 
 # ModemManager
 
+This downstream branch adds the experimental MediaTek SoC `mtk-soc` plugin
+to upstream ModemManager 1.24.2. See [MTK integration](docs/MTK-SOC.md) for
+build options, validation limits and the separate CCCI owner/FS/RPC service.
+IMS/VoLTE is not yet validated. Upstream history and license notices are kept.
+
 ModemManager provides a unified high level API for communicating with mobile
 broadband modems, regardless of the protocol used to communicate with the
 actual device (Generic AT, vendor-specific AT, QCDM, QMI, MBIM...).

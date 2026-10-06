@@ -678,6 +678,250 @@ modem_load_model (MMIfaceModem       *self,
     g_object_unref (task);
 }
 
+/*****************************************************************************/
+/* Modem modes: MediaTek AT+ERAT.                                            */
+/*                                                                           */
+/* The plugin did not implement set_current_modes, so the UI reported         */
+/* "Setting allowed modes not supported" even though the MD supports 2G/3G/   */
+/* 4G/5G.  AT+ERAT takes a bitmap (range 0-30) and AT+ERAT? answers           */
+/*   "+ERAT: <current>,<x>,<setting>,<y>,<z>"                                 */
+/* Measured on pearl:                                                         */
+/*   AT+ERAT=7  2G/3G/4G (the value the factory left behind in the OSS drop)  */
+/*   AT+ERAT=15 adds 5G NR - verified, access tech became 5gnr                */
+/*   AT+ERAT=22 factory value, LTE                                            */
+/*   AT+ERAT=8  +CME ERROR: 4, NR alone is rejected: it needs an LTE anchor   */
+/* so the bits are 1=2G, 2=3G, 4=4G, 8=5G.                                    */
+/*****************************************************************************/
+
+#define MTK_SOC_ERAT_2G 0x01
+#define MTK_SOC_ERAT_3G 0x02
+#define MTK_SOC_ERAT_4G 0x04
+#define MTK_SOC_ERAT_5G 0x08
+
+#define MTK_SOC_ALL_MODES \
+    (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G | MM_MODEM_MODE_5G)
+
+static MMModemMode
+mtk_soc_erat_to_modes (guint erat)
+{
+    MMModemMode modes = MM_MODEM_MODE_NONE;
+
+    if (erat & MTK_SOC_ERAT_2G)
+        modes |= MM_MODEM_MODE_2G;
+    if (erat & MTK_SOC_ERAT_3G)
+        modes |= MM_MODEM_MODE_3G;
+    if (erat & MTK_SOC_ERAT_4G)
+        modes |= MM_MODEM_MODE_4G;
+    if (erat & MTK_SOC_ERAT_5G)
+        modes |= MM_MODEM_MODE_5G;
+    return modes;
+}
+
+static guint
+mtk_soc_modes_to_erat (MMModemMode modes)
+{
+    guint erat = 0;
+
+    if (modes & MM_MODEM_MODE_2G)
+        erat |= MTK_SOC_ERAT_2G;
+    if (modes & MM_MODEM_MODE_3G)
+        erat |= MTK_SOC_ERAT_3G;
+    if (modes & MM_MODEM_MODE_4G)
+        erat |= MTK_SOC_ERAT_4G;
+    if (modes & MM_MODEM_MODE_5G) {
+        erat |= MTK_SOC_ERAT_5G;
+
+        /* Measured on pearl: the MD only accepts a bitmap that keeps the GSM
+         * bit when NR is enabled - AT+ERAT=8, 12 and 14 all answer
+         * "+CME ERROR: 4", while 15 is accepted and the modem then camps on
+         * 5G NR.  So asking for 5G means asking for the whole bitmap; the
+         * modem picks NR by itself when the network offers it. */
+        erat |= MTK_SOC_ERAT_2G | MTK_SOC_ERAT_3G | MTK_SOC_ERAT_4G;
+    }
+
+    return erat;
+}
+
+/* Supported modes */
+
+/* ModemManager only lets a client set a combination that the plugin listed as
+ * supported ("Cannot change modes: only one combination supported" otherwise),
+ * so the list below has to contain every set the UI may ask for. */
+static const MMModemMode mtk_soc_supported_mode_combinations[] = {
+    MM_MODEM_MODE_2G,
+    MM_MODEM_MODE_3G,
+    MM_MODEM_MODE_4G,
+    MM_MODEM_MODE_2G | MM_MODEM_MODE_3G,
+    MM_MODEM_MODE_3G | MM_MODEM_MODE_4G,
+    /* 2G+3G+4G (AT+ERAT=7) is answered with a CME error by this firmware, so
+     * it is not offered either.  Only the full bitmap can enable NR (see
+     * mtk_soc_modes_to_erat), so
+     * "5G" and "4G+5G" are deliberately absent: the MD rejects those bitmaps
+     * and ModemManager would then report a mismatch between the requested and
+     * the reloaded modes.  Picking the full set is how 5G is selected. */
+    MTK_SOC_ALL_MODES,
+};
+
+static void
+modem_load_supported_modes (MMIfaceModem        *self,
+                            GAsyncReadyCallback  callback,
+                            gpointer             user_data)
+{
+    GTask *task;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static GArray *
+modem_load_supported_modes_finish (MMIfaceModem  *self,
+                                   GAsyncResult  *res,
+                                   GError       **error)
+{
+    GArray *modes;
+    guint   i;
+
+    if (!g_task_propagate_boolean (G_TASK (res), error))
+        return NULL;
+
+    modes = g_array_sized_new (FALSE, FALSE, sizeof (MMModemModeCombination),
+                               G_N_ELEMENTS (mtk_soc_supported_mode_combinations));
+    for (i = 0; i < G_N_ELEMENTS (mtk_soc_supported_mode_combinations); i++) {
+        MMModemModeCombination mode;
+
+        mode.allowed = mtk_soc_supported_mode_combinations[i];
+        mode.preferred = MM_MODEM_MODE_NONE;
+        g_array_append_val (modes, mode);
+    }
+
+    return modes;
+}
+
+/* Current modes */
+
+static void
+current_modes_ready (MMBaseModem  *self,
+                     GAsyncResult *res,
+                     GTask        *task)
+{
+    g_autoptr(GError)  error = NULL;
+    const gchar  *response = NULL;
+    g_auto(GStrv)      split = NULL;
+    guint              erat;
+
+    response = mm_base_modem_at_command_finish (self, res, &error);
+    if (!response) {
+        g_task_return_error (task, g_steal_pointer (&error));
+        g_object_unref (task);
+        return;
+    }
+
+    /* "+ERAT: 11,0,15,0,0" - the third field is the configured bitmap */
+    split = g_strsplit (response, ",", -1);
+    if (g_strv_length (split) < 3) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                 "Unexpected AT+ERAT? response: %s", response);
+        g_object_unref (task);
+        return;
+    }
+
+    erat = (guint) g_ascii_strtoull (g_strstrip (split[2]), NULL, 10);
+    mm_obj_dbg (self, "AT+ERAT? reports bitmap 0x%x", erat);
+    g_task_return_int (task, (gssize) mtk_soc_erat_to_modes (erat));
+    g_object_unref (task);
+}
+
+static void
+modem_load_current_modes (MMIfaceModem        *self,
+                          GAsyncReadyCallback  callback,
+                          gpointer             user_data)
+{
+    GTask *task;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    mm_base_modem_at_command (MM_BASE_MODEM (self), "AT+ERAT?", 3, FALSE,
+                              (GAsyncReadyCallback) current_modes_ready, task);
+}
+
+static gboolean
+modem_load_current_modes_finish (MMIfaceModem  *self,
+                                 GAsyncResult  *res,
+                                 MMModemMode   *allowed,
+                                 MMModemMode   *preferred,
+                                 GError       **error)
+{
+    GError *inner_error = NULL;
+    gssize  value;
+
+    value = g_task_propagate_int (G_TASK (res), &inner_error);
+    if (inner_error) {
+        g_propagate_error (error, inner_error);
+        return FALSE;
+    }
+
+    *allowed = (MMModemMode) value;
+    *preferred = MM_MODEM_MODE_NONE;
+    return TRUE;
+}
+
+/* Set current modes */
+
+static void
+set_current_modes_ready (MMBaseModem  *self,
+                         GAsyncResult *res,
+                         GTask        *task)
+{
+    g_autoptr(GError) error = NULL;
+    const gchar *response = NULL;
+
+    response = mm_base_modem_at_command_finish (self, res, &error);
+    if (!response) {
+        g_task_return_error (task, g_steal_pointer (&error));
+        g_object_unref (task);
+        return;
+    }
+
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+modem_set_current_modes (MMIfaceModem        *self,
+                         MMModemMode          modes,
+                         MMModemMode          preferred,
+                         GAsyncReadyCallback  callback,
+                         gpointer             user_data)
+{
+    GTask             *task;
+    g_autofree gchar  *command = NULL;
+    guint              erat;
+
+    task = g_task_new (self, NULL, callback, user_data);
+
+    if (preferred != MM_MODEM_MODE_NONE && preferred != modes) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                 "Preferred mode is not supported by AT+ERAT");
+        g_object_unref (task);
+        return;
+    }
+
+    erat = mtk_soc_modes_to_erat (modes);
+    command = g_strdup_printf ("AT+ERAT=%u", erat);
+    mm_obj_info (self, "setting allowed modes 0x%x -> %s", modes, command);
+
+    mm_base_modem_at_command (MM_BASE_MODEM (self), command, 5, FALSE,
+                              (GAsyncReadyCallback) set_current_modes_ready, task);
+}
+
+static gboolean
+modem_set_current_modes_finish (MMIfaceModem  *self,
+                                GAsyncResult  *res,
+                                GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
 static void
 iface_modem_init (MMIfaceModemInterface *iface)
 {
@@ -697,6 +941,12 @@ iface_modem_init (MMIfaceModemInterface *iface)
     iface->load_supported_capabilities_finish = load_supported_capabilities_finish;
     iface->load_current_capabilities = load_current_capabilities;
     iface->load_current_capabilities_finish = load_current_capabilities_finish;
+    iface->load_supported_modes = modem_load_supported_modes;
+    iface->load_supported_modes_finish = modem_load_supported_modes_finish;
+    iface->load_current_modes = modem_load_current_modes;
+    iface->load_current_modes_finish = modem_load_current_modes_finish;
+    iface->set_current_modes = modem_set_current_modes;
+    iface->set_current_modes_finish = modem_set_current_modes_finish;
 }
 
 /*****************************************************************************/

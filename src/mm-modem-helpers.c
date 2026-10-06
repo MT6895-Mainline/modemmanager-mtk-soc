@@ -2002,6 +2002,50 @@ item_is_lac_not_stat (GMatchInfo *info, guint32 item)
     return is_lac;
 }
 
+/* 3GPP TS 27.007 says the <lac> and <ci> fields are hexadecimal, but MediaTek
+ * reports them in decimal: on pearl the cell id arrives as "258705009", which
+ * read as hex is 0x258705009 (37 bits) and cannot be a 28-bit cell id, so
+ * mm_location_3gpp_set_cell_id rejected it with
+ *   "Invalid Cell ID: longer than the maximum expected (8)"
+ * and the 3GPP location never became available.
+ *
+ * Read the field as hex first and fall back to decimal when the value does not
+ * fit the field width.  A genuine hex value never exceeds its width, so this
+ * cannot change the result for a modem that follows the specification.
+ */
+static guint64
+parse_location_field (GMatchInfo *info,
+                      guint32     item,
+                      guint64     max)
+{
+    g_autofree gchar *str = NULL;
+    guint64           value;
+
+    str = g_match_info_fetch (info, item);
+    if (!str)
+        return 0;
+
+    /* The field may be quoted, e.g. "1A2B" */
+    g_strstrip (str);
+    if (str[0] == '"') {
+        gchar *end = strrchr (str, '"');
+
+        if (end && end != str)
+            *end = '\0';
+        memmove (str, str + 1, strlen (str));
+    }
+
+    value = g_ascii_strtoull (str, NULL, 16);
+    if (value > max) {
+        guint64 decimal = g_ascii_strtoull (str, NULL, 10);
+
+        if (decimal <= max)
+            value = decimal;
+    }
+
+    return value;
+}
+
 gboolean
 mm_3gpp_parse_creg_response (GMatchInfo                    *info,
                              gpointer                       log_object,
@@ -2140,11 +2184,11 @@ mm_3gpp_parse_creg_response (GMatchInfo                    *info,
      * Sagem).  Need to handle that.
      */
     if (ilac)
-        mm_get_u64_from_hex_match_info (info, ilac, &lac);
+        lac = parse_location_field (info, ilac, 0xFFFF);
 
     /* Cell ID */
     if (ici)
-        mm_get_u64_from_hex_match_info (info, ici, &ci);
+        ci = parse_location_field (info, ici, 0xFFFFFFF);
 
     /* Access Technology */
     if (iact)

@@ -611,9 +611,80 @@ load_current_capabilities_finish (MMIfaceModem  *self,
     return (MMModemCapability) g_task_propagate_int (G_TASK (res), error);
 }
 
+/*****************************************************************************/
+/* Manufacturer and model (Modem interface)                                   */
+/*                                                                            */
+/* The MD answers AT+CGMI with "MTK1" and AT+CGMM with "MTK2".  Those are      */
+/* firmware placeholders, so report the actual silicon name instead.  Both     */
+/* strings stay overridable through MTK_CCCI_MANUFACTURER / MTK_CCCI_MODEL,    */
+/* which is also how a different MediaTek part can be described without        */
+/* touching the source.                                                       */
+
+#define MTK_SOC_DEFAULT_MANUFACTURER "MediaTek"
+#define MTK_SOC_DEFAULT_MODEL        "MediaTek M80"
+
+static const gchar *
+mtk_soc_identity (const gchar *env, const gchar *fallback)
+{
+    const gchar *value;
+
+    value = g_getenv (env);
+    return (value && *value) ? value : fallback;
+}
+
+static gchar *
+modem_load_manufacturer_finish (MMIfaceModem *self,
+                                GAsyncResult *res,
+                                GError      **error)
+{
+    return g_task_propagate_pointer (G_TASK (res), error);
+}
+
+static void
+modem_load_manufacturer (MMIfaceModem       *self,
+                         GAsyncReadyCallback callback,
+                         gpointer            user_data)
+{
+    GTask       *task;
+    const gchar *value;
+
+    value = mtk_soc_identity ("MTK_CCCI_MANUFACTURER", MTK_SOC_DEFAULT_MANUFACTURER);
+    mm_obj_dbg (self, "reporting manufacturer '%s'", value);
+    task = g_task_new (self, NULL, callback, user_data);
+    g_task_return_pointer (task, g_strdup (value), g_free);
+    g_object_unref (task);
+}
+
+static gchar *
+modem_load_model_finish (MMIfaceModem *self,
+                         GAsyncResult *res,
+                         GError      **error)
+{
+    return g_task_propagate_pointer (G_TASK (res), error);
+}
+
+static void
+modem_load_model (MMIfaceModem       *self,
+                  GAsyncReadyCallback callback,
+                  gpointer            user_data)
+{
+    GTask       *task;
+    const gchar *value;
+
+    value = mtk_soc_identity ("MTK_CCCI_MODEL", MTK_SOC_DEFAULT_MODEL);
+    mm_obj_dbg (self, "reporting model '%s'", value);
+    task = g_task_new (self, NULL, callback, user_data);
+    g_task_return_pointer (task, g_strdup (value), g_free);
+    g_object_unref (task);
+}
+
 static void
 iface_modem_init (MMIfaceModemInterface *iface)
 {
+    iface->load_manufacturer = modem_load_manufacturer;
+    iface->load_manufacturer_finish = modem_load_manufacturer_finish;
+    iface->load_model = modem_load_model;
+    iface->load_model_finish = modem_load_model_finish;
     iface->load_sim_slots = load_sim_slots;
     iface->load_sim_slots_finish = load_sim_slots_finish;
     iface->set_primary_sim_slot = set_primary_sim_slot;

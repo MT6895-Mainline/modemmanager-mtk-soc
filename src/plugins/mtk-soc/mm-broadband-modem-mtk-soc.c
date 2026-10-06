@@ -1109,6 +1109,77 @@ ignored_urc_received (MMBroadbandModemMtkSoc *self,
     mm_obj_dbg (self, "ignoring MediaTek unsolicited response: %s", line);
 }
 
+/* The MD reports SIM insert/remove on its own:
+ *
+ *   +ESIMS: <status>,<something>        e.g.  "+ESIMS: 0,11" when the tray
+ *                                       (both cards at once on this board) is
+ *                                       pulled
+ *
+ * Nothing handled it, so ModemManager kept advertising the old SIM forever:
+ * pulling the tray left the SIM objects, the registration and the data call
+ * exactly as they were.  The line was not even in the ignored-URC list, so it
+ * also arrived in the middle of unrelated command/response pairs.
+ *
+ * Registering it and triggering the standard SIM re-probe fixes both.  This is
+ * the same shape the cinterion plugin uses for its ^SCKS report. */
+#define MTK_SOC_LAST_ESIMS "mtk-soc-last-esims-status"
+
+static void
+esims_urc_received (MMBroadbandModemMtkSoc *self,
+                    GMatchInfo              *match_info)
+{
+    g_autofree gchar *line = NULL;
+    g_autofree gchar *status = NULL;
+    const gchar      *last;
+
+    line = g_match_info_fetch (match_info, 0);
+
+    /* "+ESIMS: <status>,<other>" - the first field is what changes on a
+     * hot-plug (1 with the cards in, 0 once the tray is pulled). */
+    if (match_info && g_match_info_get_match_count (match_info) > 1)
+        status = g_match_info_fetch (match_info, 1);
+    if (status)
+        status = g_strstrip (status);
+
+    last = g_object_get_data (G_OBJECT (self), MTK_SOC_LAST_ESIMS);
+    if (status && last && g_strcmp0 (status, last) == 0) {
+        mm_obj_dbg (self, "SIM status unchanged (%s), not reprobing", status);
+        return;
+    }
+
+    mm_obj_info (self, "SIM status report: %s", line);
+    g_object_set_data_full (G_OBJECT (self), MTK_SOC_LAST_ESIMS,
+                            g_strdup (status ? status : ""), g_free);
+
+    /* A full disable + reprobe is the standard MM way to pick up a SIM change
+     * (the cinterion plugin does the same from its ^SCKS report).  Doing it on
+     * every report instead would leave the modem re-initializing whenever the
+     * modem repeats the status, which is what made the UI sit on "loading"
+     * and re-request the location permission over and over. */
+    mm_iface_modem_process_sim_event (MM_IFACE_MODEM (self));
+}
+
+static void
+setup_sim_status_handler (MMBroadbandModemMtkSoc *self)
+{
+    MMPortSerialAt *port;
+    g_autoptr(GRegex) regex = NULL;
+
+    port = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
+    if (!port) {
+        mm_obj_warn (self, "no primary AT port; SIM status handler not set");
+        return;
+    }
+
+    regex = g_regex_new ("\\+ESIMS:\\s*([0-9]+)", G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
+    mm_port_serial_at_add_unsolicited_msg_handler (port,
+                                                   regex,
+                                                   (MMPortSerialAtUnsolicitedMsgFn) esims_urc_received,
+                                                   self,
+                                                   NULL);
+    mm_obj_dbg (self, "registered MediaTek SIM status handler");
+}
+
 static void
 setup_ignored_unsolicited_handlers (MMBroadbandModemMtkSoc *self)
 {
@@ -1135,6 +1206,9 @@ setup_ignored_unsolicited_handlers (MMBroadbandModemMtkSoc *self)
     mm_obj_dbg (self, "registered %u MediaTek unsolicited handlers in %s",
                 (guint) G_N_ELEMENTS (mtk_soc_ignored_urcs),
                 mm_port_get_device (MM_PORT (port)));
+
+    /* +ESIMS is handled, not ignored: it is the SIM hot-plug report. */
+    setup_sim_status_handler (self);
 }
 
 static void

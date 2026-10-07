@@ -321,6 +321,25 @@ append_ursp_descriptor (GByteArray  *payload,
 }
 
 GBytes *
+mm_mtk_mipc_ims_pdn_activate_request (guint8 ps, guint16 transaction_id)
+{
+    g_autoptr(GByteArray) payload = g_byte_array_new ();
+    guint8 value[4];
+
+    /* Order matters: the stock frame is written in this sequence. */
+    write_u32 (value, 1);
+    append_tlv (payload, 0x010f, value, sizeof (value));
+    write_u32 (value, 2);
+    append_tlv (payload, 0x0102, value, sizeof (value));
+    value[0] = 3;
+    append_tlv (payload, 0x010a, value, 1);
+    append_ursp_descriptor (payload, "ims");
+
+    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_DATA_ACT_REQ, ps, transaction_id,
+                                    payload->data, payload->len);
+}
+
+GBytes *
 mm_mtk_mipc_data_ims_reuse_request (guint8 ps, guint16 transaction_id)
 {
     g_autoptr(GByteArray) payload = g_byte_array_new ();
@@ -345,6 +364,20 @@ mm_mtk_mipc_data_act_request (guint8        ps,
                               const gchar  *user,
                               const gchar  *password,
                               GError      **error)
+{
+    return mm_mtk_mipc_data_act_request_typed (ps, transaction_id, apn, user,
+                                               password, 1, 0, error);
+}
+
+GBytes *
+mm_mtk_mipc_data_act_request_typed (guint8        ps,
+                                    guint16       transaction_id,
+                                    const gchar  *apn,
+                                    const gchar  *user,
+                                    const gchar  *password,
+                                    guint32       apn_type,
+                                    guint32       apn_index,
+                                    GError      **error)
 {
     g_autoptr(GByteArray) payload = NULL;
     g_autofree guint8 *apn_value = NULL;
@@ -388,13 +421,13 @@ mm_mtk_mipc_data_act_request (guint8        ps,
     append_tlv (payload, MIPC_TLV_APN, apn_value, apn_len);
     write_u32 (value, 0x7FFDFFFFu);
     append_tlv (payload, MIPC_TLV_BEARER, value, sizeof (value));
-    write_u32 (value, 1);
+    write_u32 (value, apn_type);
     append_tlv (payload, MIPC_TLV_APN_TYPE, value, sizeof (value));
     byte = 0;
     append_tlv (payload, MIPC_TLV_REUSE_FLAG, &byte, sizeof (byte));
     byte = 3;
     append_tlv (payload, MIPC_TLV_PDP_TYPE, &byte, sizeof (byte));
-    write_u32 (value, 0);
+    write_u32 (value, apn_index);
     append_tlv (payload, MIPC_TLV_APN_INDEX, value, sizeof (value));
     byte = 3;
     append_tlv (payload, MIPC_TLV_ROAMING, &byte, sizeof (byte));

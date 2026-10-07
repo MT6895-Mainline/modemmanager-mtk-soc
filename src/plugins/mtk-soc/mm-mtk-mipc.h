@@ -157,6 +157,32 @@ GBytes *mm_mtk_mipc_data_act_request (guint8        ps,
                                       const gchar  *password,
                                       GError      **error);
 
+/* Same frame with an explicit APN_TYPE (TLV 0x0106): 1 = default/internet,
+ * 2 = IMS.  The stock RIL asks for the IMS PDN with type 2 (see the
+ * REUSE_ONLY frame below), so a plain "ims" APN sent as type 1 may create a
+ * default-domain call instead of an IMS one. */
+GBytes *mm_mtk_mipc_data_act_request_typed (guint8        ps,
+                                            guint16       transaction_id,
+                                            const gchar  *apn,
+                                            const gchar  *user,
+                                            const gchar  *password,
+                                            guint32       apn_type,
+                                            guint32       apn_index,
+                                            GError      **error);
+
+/* IMS PDN activation, byte-for-byte what the stock RIL sends right before the
+ * modem reports IMS_PDN_IND state 2 and starts SIP registration.  It is NOT a
+ * profile-creation frame: the modem already holds an enabled IMS profile
+ * (AP profile type=0x2 apn=ims), and a full DATA_ACT frame is accepted
+ * (result 0) without ever activating the PDN.  Payload, measured 2026-10-07:
+ *   TLV 0x010F u32 = 1
+ *   TLV 0x0102 u32 = 2      (APN_TYPE = IMS)
+ *   TLV 0x010A u8  = 3
+ *   TLV 0x010D      = 672-byte URSP descriptor carrying "ims"
+ */
+GBytes *mm_mtk_mipc_ims_pdn_activate_request (guint8  ps,
+                                              guint16 transaction_id);
+
 /* Stock IMS early-exit frame: APN_TYPE=IMS, REUSE_ONLY, DNN="ims".
  * Does not carry a new APN profile or default-data credentials. */
 GBytes *mm_mtk_mipc_data_ims_reuse_request (guint8 ps, guint16 transaction_id);

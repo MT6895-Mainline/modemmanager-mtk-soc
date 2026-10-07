@@ -35,6 +35,9 @@
 #define MIPC_TXID_DATA_ACT     2
 #define MIPC_TXID_DATA_DEACT   3
 #define MIPC_TXID_CALL_LIST    4
+/* Separate transaction for the IMS bearer so it can never be confused with
+ * the default-data one. */
+#define MIPC_TXID_IMS_ACT           0x00e0
 #define MIPC_TXID_DATA_ACT_RETRY 5
 #define MIPC_TXID_REGIND       16
 #define MIPC_TEST_TIMEOUT_MS   3000
@@ -896,6 +899,75 @@ connect_thread (GTask        *task,
             mm_mtk_mipc_frame_clear (&frame);
 
             if (cnf.result == 0) {
+                /* Bring the IMS bearer up on the same MIPC connection.  On an
+                 * LTE/NR-only network there is no CS domain, so both VoLTE and
+                 * MO SMS depend on IMS being registered; without the dedicated
+                 * IMS PDN the modem never starts SIP registration at all.
+                 * Measured 2026-10-07: a full DATA_ACT frame with APN "ims" and
+                 * ps = slot is accepted (CNF result 0) and the modem then emits
+                 * +EIF: <id>, ifup, ... for the new interface.  The REUSE_ONLY
+                 * variant is refused (0x150102) because there is nothing to
+                 * reuse yet.  Best effort: a refusal must not fail the data
+                 * call. */
+                {
+                    g_autoptr(GBytes)   ims_request = NULL;
+                    g_autoptr(GError)   ims_error = NULL;
+                    MMMtkMipcDataActCnf ims_cnf;
+
+                    ims_request = mm_mtk_mipc_ims_pdn_activate_request (ctx->slots[i],
+                                                                        MIPC_TXID_IMS_ACT);
+                    if (!ims_request) {
+                        mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                    "cannot build IMS DATA_ACT: %s",
+                                    ims_error ? ims_error->message : "?");
+                    } else if (!mipc_exchange (fd, buffer, ims_request,
+                                               MM_MTK_MIPC_DATA_ACT_CNF,
+                                               ctx->slots[i], MIPC_TXID_IMS_ACT,
+                                               MIPC_DATA_TIMEOUT_MS, &frame, &ims_error)) {
+                        mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                    "IMS DATA_ACT got no CNF: %s",
+                                    ims_error ? ims_error->message : "?");
+                    } else if (!mm_mtk_mipc_parse_data_act_cnf (frame.payload, &ims_cnf,
+                                                                &ims_error)) {
+                        /* The accepted IMS DATA_ACT answers with a much larger
+                         * frame than the refusal path, and the generic parser
+                         * does not understand it.  Dump enough of it (plus any
+                         * result TLV we can find) to see what the modem said. */
+                        const guint8 *raw = NULL;
+                        gsize         raw_len = 0;
+                        guint32       raw_result = G_MAXUINT32;
+                        g_autofree gchar *hex = NULL;
+                        gsize         n;
+                        gsize         k;
+
+                        if (frame.payload)
+                            raw = g_bytes_get_data (frame.payload, &raw_len);
+                        n = MIN (raw_len, (gsize) 96);
+                        hex = g_malloc0 (n * 2 + 1);
+                        for (k = 0; k < n; k++)
+                            g_snprintf (hex + k * 2, 3, "%02x", raw[k]);
+                        if (mm_mtk_mipc_find_u32_tlv (frame.payload,
+                                                      MM_MTK_MIPC_TLV_RESULT,
+                                                      &raw_result, NULL))
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS DATA_ACT CNF len=%u result=%u hex=%s",
+                                        (guint) raw_len, raw_result, hex);
+                        else
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS DATA_ACT CNF len=%u (no result TLV) hex=%s",
+                                        (guint) raw_len, hex);
+                    } else if (ims_cnf.result != 0) {
+                        mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                    "IMS DATA_ACT on SIM slot %u refused with result %u",
+                                    ctx->slots[i], ims_cnf.result);
+                    } else {
+                        mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                    "IMS bearer up on SIM slot %u (call id %u, iface %u)",
+                                    ctx->slots[i], ims_cnf.call_id, ims_cnf.interface_id);
+                    }
+                    mm_mtk_mipc_frame_clear (&frame);
+                }
+
                 if (g_strcmp0 (g_getenv ("QQC_MIPC_IMS_SNAPSHOT"), "1") == 0)
                     mipc_snapshot_ims (fd, buffer, ctx->slots[i]);
                 result = g_new0 (MtkSocConnectResult, 1);

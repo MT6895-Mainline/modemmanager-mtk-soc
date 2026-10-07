@@ -1255,6 +1255,81 @@ typedef struct {
     guint                   attempts_left;
 } MtkSocCgsmsContext;
 
+/* IMS bring-up, mirroring what Android's RIL does at boot (captured from the
+ * stock ROM on 2026-10-07):
+ *   AT+EIMSCFG=3,3,0,0,1,1   IMS feature configuration
+ *   AT+CIREG=2               enable IMS registration reporting
+ *   AT+EIMSRCS=0,0           IMS registration/response code setting
+ * All three are accepted by the MD.  They are only half of the picture -- the
+ * IMS PDN has to exist as well, which the bearer creates -- but without them
+ * the modem never even tries to register.  Sent once, best effort. */
+#define MTK_SOC_IMS_CONFIG_ATTEMPTS 4
+#define MTK_SOC_IMS_CONFIG_DELAY_S  5
+
+static void
+mtk_soc_ims_config_next (MMBroadbandModemMtkSoc *self,
+                         guint                    index,
+                         guint                    attempts_left);
+
+static void
+mtk_soc_ims_config_done (MMBroadbandModemMtkSoc *self)
+{
+    mm_obj_dbg (self, "IMS configuration sequence finished");
+}
+
+static void
+mtk_soc_ims_config_ready (MMBaseModem  *self,
+                          GAsyncResult *res,
+                          gpointer      user_data)
+{
+    g_autoptr(GError) error = NULL;
+    guint             index = GPOINTER_TO_UINT (user_data);
+    guint             attempts_left;
+
+    attempts_left = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (self), "mtk-soc-ims-attempts"));
+    if (!mm_base_modem_at_command_finish (self, res, &error)) {
+        mm_obj_dbg (self, "IMS AT step %u failed: %s", index,
+                    error ? error->message : "?");
+        if (attempts_left > 0)
+            mtk_soc_ims_config_next (MM_BROADBAND_MODEM_MTK_SOC (self), index,
+                                     attempts_left - 1);
+        return;
+    }
+    mtk_soc_ims_config_next (MM_BROADBAND_MODEM_MTK_SOC (self), index + 1, 0);
+}
+
+static void
+mtk_soc_ims_config_next (MMBroadbandModemMtkSoc *self,
+                         guint                    index,
+                         guint                    attempts_left)
+{
+    static const gchar *const steps[] = {
+        "AT+EIMSCFG=3,3,0,0,1,1",
+        "AT+CIREG=2",
+        "AT+EIMSRCS=0,0",
+    };
+
+    if (index >= G_N_ELEMENTS (steps)) {
+        mtk_soc_ims_config_done (self);
+        return;
+    }
+
+    g_object_set_data (G_OBJECT (self), "mtk-soc-ims-attempts",
+                       GUINT_TO_POINTER (attempts_left));
+    mm_obj_dbg (self, "IMS AT step %u/%u: %s", index + 1,
+                (guint) G_N_ELEMENTS (steps), steps[index]);
+    mm_base_modem_at_command (MM_BASE_MODEM (self), steps[index],
+                              MTK_SOC_IMS_CONFIG_DELAY_S, FALSE,
+                              (GAsyncReadyCallback) mtk_soc_ims_config_ready,
+                              GUINT_TO_POINTER (index));
+}
+
+static void
+mtk_soc_ims_config_start (MMBroadbandModemMtkSoc *self)
+{
+    mtk_soc_ims_config_next (self, 0, MTK_SOC_IMS_CONFIG_ATTEMPTS);
+}
+
 #define MTK_SOC_CGSMS_ATTEMPTS 4
 #define MTK_SOC_CGSMS_DELAY_S  5
 
@@ -1277,6 +1352,9 @@ cgsms_ready (MMBaseModem *self,
 
     if (mm_base_modem_at_command_finish (self, res, &error)) {
         mm_obj_dbg (cgsms->self, "SMS bearer set to packet-domain preferred (+CGSMS=3)");
+        /* Start the IMS sequence BEFORE cgsms_finished(), which drops the last
+         * reference to the modem and frees cgsms itself. */
+        mtk_soc_ims_config_start (cgsms->self);
         cgsms_finished (cgsms);
         return;
     }

@@ -15,6 +15,8 @@ G_BEGIN_DECLS
 #define MM_MTK_MIPC_TEST_CNF       0x0306
 #define MM_MTK_MIPC_OPEN_REQ       0x0301
 #define MM_MTK_MIPC_OPEN_CNF       0x0302
+#define MM_MTK_MIPC_DATA_RETRY_TIMER_REQ 0x021b
+#define MM_MTK_MIPC_DATA_RETRY_TIMER_CNF 0x021c
 #define MM_MTK_MIPC_DATA_ACT_REQ   0x0201
 #define MM_MTK_MIPC_DATA_ACT_CNF   0x0202
 #define MM_MTK_MIPC_DATA_DEACT_REQ 0x0203
@@ -180,6 +182,9 @@ GBytes *mm_mtk_mipc_data_act_request_typed (guint8        ps,
  *   TLV 0x010A u8  = 3
  *   TLV 0x010D      = 672-byte URSP descriptor carrying "ims"
  */
+GBytes *mm_mtk_mipc_ims_retry_timer_request (guint8  ps,
+                                             guint16 transaction_id);
+
 GBytes *mm_mtk_mipc_ims_pdn_activate_request (guint8  ps,
                                               guint16 transaction_id);
 

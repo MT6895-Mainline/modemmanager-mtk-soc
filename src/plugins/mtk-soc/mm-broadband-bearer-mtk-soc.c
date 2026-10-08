@@ -38,6 +38,7 @@
 /* Separate transaction for the IMS bearer so it can never be confused with
  * the default-data one. */
 #define MIPC_TXID_IMS_ACT           0x00e0
+#define MIPC_TXID_IMS_RETRY_TIMER   0x00df
 #define MIPC_TXID_DATA_ACT_RETRY 5
 #define MIPC_TXID_REGIND       16
 #define MIPC_TEST_TIMEOUT_MS   3000
@@ -914,8 +915,50 @@ connect_thread (GTask        *task,
                     g_autoptr(GError)   ims_error = NULL;
                     MMMtkMipcDataActCnf ims_cnf;
 
-                    ims_request = mm_mtk_mipc_ims_pdn_activate_request (ctx->slots[i],
-                                                                        MIPC_TXID_IMS_ACT);
+                    /*
+                     * Stock order: DATA_RETRY_TIMER_REQ (0x021b) first, then the
+                     * DATA_ACT.  The modem refuses the activation otherwise.
+                     * Best effort -- a missing CNF must not fail the data call.
+                     */
+                    {
+                        g_autoptr(GBytes) timer_request = NULL;
+                        gsize             timer_len = 0;
+                        const guint8     *timer_data = NULL;
+
+                        /*
+                         * Fire and forget, exactly like the stock stack: it sends
+                         * 0x021b and the DATA_ACT back to back (txid 0x0466 then
+                         * 0x0467).  The modem answers this one on the indication
+                         * channel -- observed "modem IND 0x021c ... len=8
+                         * 0000040002000000" -- so waiting for a CNF here only
+                         * stalls the activation for the entire timeout.
+                         */
+                        timer_request = mm_mtk_mipc_ims_retry_timer_request (ctx->slots[i],
+                                                                            MIPC_TXID_IMS_RETRY_TIMER);
+                        if (timer_request)
+                            timer_data = g_bytes_get_data (timer_request, &timer_len);
+                        if (timer_data && timer_len > 0 &&
+                            write (fd, timer_data, timer_len) != (ssize_t) timer_len)
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS DATA_RETRY_TIMER write failed: %s",
+                                        g_strerror (errno));
+                    }
+
+                    /*
+                     * Use the FULL frame here, not the minimal four-TLV one.
+                     * Measured on this modem: the minimal frame is answered with
+                     * 0x150102 (the "nothing to reuse" refusal, same code the
+                     * REUSE_ONLY variant gets) and a 312-byte CNF carrying no IP
+                     * parameters at all, while the full frame returns a CNF with
+                     * the interface and the modem emits "+EIF: <id>, ifup, ...".
+                     * Now that 0x021b goes out first, this is the combination
+                     * that has not been tried yet.
+                     */
+                    ims_request = mm_mtk_mipc_data_act_request_typed (ctx->slots[i],
+                                                                     MIPC_TXID_IMS_ACT,
+                                                                     "ims", NULL, NULL,
+                                                                     2 /* APN_TYPE_IMS */,
+                                                                     0, &ims_error);
                     if (!ims_request) {
                         mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
                                     "cannot build IMS DATA_ACT: %s",

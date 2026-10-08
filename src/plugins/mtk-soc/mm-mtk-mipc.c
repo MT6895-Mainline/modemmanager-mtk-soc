@@ -321,6 +321,25 @@ append_ursp_descriptor (GByteArray  *payload,
 }
 
 GBytes *
+mm_mtk_mipc_ims_retry_timer_request (guint8 ps, guint16 transaction_id)
+{
+    g_autoptr(GByteArray) payload = g_byte_array_new ();
+    guint8 apn[4] = { 'i', 'm', 's', 0 };
+
+    /*
+     * The stock stack sends this immediately before the IMS DATA_ACT, with the
+     * APN name in TLV 0x0104.  Without it the modem answers the activation with
+     * result TLV 0x0126 = 2 and no IP parameters at all (312-byte CNF instead of
+     * the 704-byte one that carries address/mask/MTU/DNS/interface id), and the
+     * IMS PDN never comes up -- so no 4a03, no SIP REGISTER, no +CIREGU.
+     */
+    append_tlv (payload, 0x0104, apn, sizeof (apn));
+
+    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_DATA_RETRY_TIMER_REQ, ps,
+                                    transaction_id, payload->data, payload->len);
+}
+
+GBytes *
 mm_mtk_mipc_ims_pdn_activate_request (guint8 ps, guint16 transaction_id)
 {
     g_autoptr(GByteArray) payload = g_byte_array_new ();

@@ -138,6 +138,48 @@ mipc_write_all (gint      fd,
  * that was not the CNF we happened to be waiting for was silently dropped, which
  * is why the firmware's own reporting (IMS state/VoPS/registration, network
  * registration, SIM events) was invisible.  Log them instead of discarding. */
+/* qqcandy: 0x4302 INTERNAL_EIF_IND carries the interface up/down report.  The
+ * stock RILD turns it into "+EIF: <id>, ifup, <type>, <ipv4>, <ipv6>, <n>" and
+ * then configures the matching ccmni interface.  Nothing in our stack did that,
+ * which is why the IMS PDN could be active inside the modem while the host side
+ * never got an interface.  Walk the TLVs and log them; the interface id is
+ * TLV 0x0401 (u32). */
+static void
+mm_mtk_eif_decode (const guint8 *data, gsize size)
+{
+    gsize off = 0;
+
+    while (off + 4 <= size) {
+        guint16 kind = (guint16) (data[off] | (data[off + 1] << 8));
+        guint16 len  = (guint16) (data[off + 2] | (data[off + 3] << 8));
+        gsize   voff = off + 4;
+        gsize   block;
+
+        if (voff + len > size)
+            break;
+        block = 4 + len;
+        block = (block + 7) & ~(gsize) 7;   /* TLVs are padded to 8 bytes */
+
+        if (len == 4) {
+            guint32 v = (guint32) data[voff] | ((guint32) data[voff + 1] << 8) |
+                        ((guint32) data[voff + 2] << 16) | ((guint32) data[voff + 3] << 24);
+            g_debug ("mtk-soc: EIF tlv 0x%04x u32=%u (0x%x)", kind, v, v);
+        } else if (len >= 4 && len <= 16) {
+            g_autofree gchar *hex = g_malloc (len * 2 + 1);
+            gsize i;
+            for (i = 0; i < len; i++)
+                g_snprintf (hex + i * 2, 3, "%02x", data[voff + i]);
+            g_debug ("mtk-soc: EIF tlv 0x%04x len=%u hex=%s", kind, len, hex);
+        } else {
+            g_debug ("mtk-soc: EIF tlv 0x%04x len=%u", kind, len);
+        }
+
+        off += block;
+        if (block == 0)
+            break;
+    }
+}
+
 static void
 mipc_handle_unsolicited (const MMMtkMipcFrame *frame)
 {
@@ -167,6 +209,9 @@ mipc_handle_unsolicited (const MMMtkMipcFrame *frame)
              frame->message_id, frame->ps, frame->transaction_id,
              (guint) size, size ? " " : "", hex,
              n < size ? " [truncated]" : "");
+
+    if (frame->message_id == 0x4302 && data && size)
+        mm_mtk_eif_decode (data, size);
 }
 
 static gboolean
@@ -783,6 +828,7 @@ mipc_handshake (gint            fd,
             0x4a08, /* IMS_REG_REMAIN_TIME_IND  */
             0x4a09, /* IMS_UI_IND               */
             0x4401, /* NW_REGISTER_IND          */
+            0x4302, /* INTERNAL_EIF_IND         */
             0x4008, /* SYS_EL2_IP_DL_IND         */
             0x4201, /* DATA_ACT_CALL_IND        */
             0x4202, /* DATA_DEACT_CALL_IND      */

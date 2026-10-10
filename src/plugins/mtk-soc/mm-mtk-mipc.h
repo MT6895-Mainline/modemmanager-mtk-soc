@@ -48,7 +48,7 @@ G_BEGIN_DECLS
 #define MM_MTK_MIPC_MAX_CREDENTIAL_LEN 63
 
 /* TLV kinds used in the 0x202 confirmation. */
-#define MM_MTK_MIPC_TLV_RESULT        0x0000
+#define MM_MTK_MIPC_TLV_RESULT        0x0126
 #define MM_MTK_MIPC_TLV_DATA_CALL_ID  0x0100
 #define MM_MTK_MIPC_TLV_MTU           0x0123
 #define MM_MTK_MIPC_TLV_INTERFACE_ID  0x0125

@@ -1100,10 +1100,14 @@ static const gchar *mtk_soc_ignored_urcs[] = {
 };
 
 static void
-ignored_urc_received (MMBroadbandModemMtkSoc *self,
-                      GMatchInfo              *match_info)
+ignored_urc_received (MMPortSerialAt *port,
+                      GMatchInfo     *match_info,
+                      gpointer        user_data)
 {
+    MMBroadbandModemMtkSoc *self = MM_BROADBAND_MODEM_MTK_SOC (user_data);
     g_autofree gchar *line = NULL;
+
+    (void) port;
 
     line = g_match_info_fetch (match_info, 0);
     mm_obj_dbg (self, "ignoring MediaTek unsolicited response: %s", line);
@@ -1125,12 +1129,16 @@ ignored_urc_received (MMBroadbandModemMtkSoc *self,
 #define MTK_SOC_LAST_ESIMS "mtk-soc-last-esims-status"
 
 static void
-esims_urc_received (MMBroadbandModemMtkSoc *self,
-                    GMatchInfo              *match_info)
+esims_urc_received (MMPortSerialAt *port,
+                    GMatchInfo     *match_info,
+                    gpointer        user_data)
 {
+    MMBroadbandModemMtkSoc *self = MM_BROADBAND_MODEM_MTK_SOC (user_data);
     g_autofree gchar *line = NULL;
     g_autofree gchar *status = NULL;
     const gchar      *last;
+
+    (void) port;
 
     line = g_match_info_fetch (match_info, 0);
 

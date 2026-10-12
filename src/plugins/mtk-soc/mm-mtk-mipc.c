@@ -726,7 +726,8 @@ mm_mtk_mipc_parse_data_act_cnf (GBytes              *payload,
 
     memset (cnf, 0, sizeof (*cnf));
 
-    if (!mm_mtk_mipc_find_u32_tlv (payload, MM_MTK_MIPC_TLV_RESULT, &cnf->result, error))
+    if (!mm_mtk_mipc_find_u32_tlv (payload, MM_MTK_MIPC_TLV_RESULT,
+                                   &cnf->result, error))
         return FALSE;
 
     /* Error confirmations only carry the result code. */
@@ -741,7 +742,7 @@ mm_mtk_mipc_parse_data_act_cnf (GBytes              *payload,
     if (!parse_u32 (payload, MM_MTK_MIPC_TLV_TRANS_INTF_ID, &cnf->trans_intf_id,
                     FALSE, error))
         return FALSE;
-    if (!parse_bytes4 (payload, MM_MTK_MIPC_TLV_IPV4_ADDRESS, cnf->ipv4, TRUE, error))
+    if (!parse_bytes4 (payload, MM_MTK_MIPC_TLV_IPV4_ADDRESS, cnf->ipv4, FALSE, error))
         return FALSE;
     if (!parse_bytes4 (payload, MM_MTK_MIPC_TLV_IPV4_GATEWAY, cnf->gateway, FALSE, error))
         return FALSE;

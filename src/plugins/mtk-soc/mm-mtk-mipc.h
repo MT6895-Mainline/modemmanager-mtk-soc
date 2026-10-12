@@ -47,8 +47,16 @@ G_BEGIN_DECLS
 #define MM_MTK_MIPC_MAX_APN_LEN        99
 #define MM_MTK_MIPC_MAX_CREDENTIAL_LEN 63
 
-/* TLV kinds used in the 0x202 confirmation. */
-#define MM_MTK_MIPC_TLV_RESULT        0x0126
+/* Result codes live in TLV 0x0000 as a u32 in every confirmation, DATA_ACT
+ * included.  Measured on the device:
+ *   TEST_CNF    : TLV 0x0000 len=4 (21 = informational)
+ *   OPEN_CNF    : TLV 0x0000 len=4 (0 = success)
+ *   DATA_ACT_CNF: TLV 0x0000 len=4; a refusal reports e.g. 0x00150102
+ *                 ("nothing to reuse"), an accepted activation reports 0.
+ * TLV 0x0126 is *not* a result: it mirrors the data call id (0x0127 mirrors
+ * the interface id + 1), so reading it as a result makes an accepted
+ * activation with call id 1..3 look refused. */
+#define MM_MTK_MIPC_TLV_RESULT        0x0000
 #define MM_MTK_MIPC_TLV_DATA_CALL_ID  0x0100
 #define MM_MTK_MIPC_TLV_MTU           0x0123
 #define MM_MTK_MIPC_TLV_INTERFACE_ID  0x0125

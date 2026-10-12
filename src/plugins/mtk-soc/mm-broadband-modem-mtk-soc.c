@@ -452,6 +452,10 @@ create_bearer (MMIfaceModem        *self,
     g_object_unref (task);
 }
 
+/* Instance-data key set while AT+ESIMMAP is in flight; the +ESIMS
+ * handler must not reprobe during that window (see its comment). */
+#define MTK_SOC_SIM_SWITCH_IN_FLIGHT "mtk-soc-sim-switch-in-flight"
+
 /*****************************************************************************/
 /* Primary SIM slot switching (AT+ESIMMAP)                                    */
 /*                                                                            */
@@ -493,6 +497,8 @@ set_primary_sim_slot_ready (MMBaseModem  *self,
 
     ctx = g_task_get_task_data (task);
 
+    g_object_set_data (G_OBJECT (self), MTK_SOC_SIM_SWITCH_IN_FLIGHT, NULL);
+
     if (!mm_base_modem_at_command_finish (self, res, &error)) {
         if (!error)
             error = g_error_new_literal (MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
@@ -529,6 +535,11 @@ set_primary_sim_slot (MMIfaceModem        *self,
     ctx = g_slice_new0 (SetPrimarySimSlotContext);
     ctx->sim_slot = sim_slot;
     g_task_set_task_data (task, ctx, (GDestroyNotify) set_primary_sim_slot_context_free);
+
+    /* The modem will answer AT+ESIMMAP with OK and an +ESIMS URC; the URC
+     * handler must not reprobe mid-request (see esims_urc_received()). */
+    g_object_set_data (G_OBJECT (self), MTK_SOC_SIM_SWITCH_IN_FLIGHT,
+                       GINT_TO_POINTER (1));
 
     cmd = g_strdup_printf ("AT+ESIMMAP=%u", 1u << (sim_slot - 1));
     mm_base_modem_at_command (MM_BASE_MODEM (self), cmd, 10, FALSE,
@@ -1141,6 +1152,16 @@ esims_urc_received (MMPortSerialAt *port,
     (void) port;
 
     line = g_match_info_fetch (match_info, 0);
+
+    /* The modem emits +ESIMS as a side effect of AT+ESIMMAP as well.  If a
+     * primary-slot switch is running, reprobing here would dispose the modem
+     * and cancel the very request that triggered the URC (the caller sees
+     * "Operation was cancelled" although the switch did happen).  MM core
+     * reprobes by itself once the switch completes, so stay quiet. */
+    if (g_object_get_data (G_OBJECT (self), MTK_SOC_SIM_SWITCH_IN_FLIGHT)) {
+        mm_obj_dbg (self, "SIM status report during a slot switch (not reprobing): %s", line);
+        return;
+    }
 
     /* "+ESIMS: <status>,<other>" - the first field is what changes on a
      * hot-plug (1 with the cards in, 0 once the tray is pulled). */

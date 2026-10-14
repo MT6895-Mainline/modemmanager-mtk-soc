@@ -40,6 +40,10 @@
 #define MIPC_TXID_IMS_ACT           0x00e0
 #define MIPC_TXID_IMS_RETRY_TIMER   0x00df
 #define MIPC_TXID_IMS_CFG           0x00e1
+#define MIPC_TXID_IMS_CFG_KV        0x00e2
+#define MIPC_TXID_WFC_ENABLE        0x00e3
+#define MIPC_TXID_WFC_PREF          0x00e4
+#define MIPC_TXID_IMS_STATE         0x00e5
 #define MIPC_TXID_DATA_ACT_RETRY 5
 #define MIPC_TXID_REGIND       16
 #define MIPC_TEST_TIMEOUT_MS   3000
@@ -1006,9 +1010,38 @@ connect_thread (GTask        *task,
                     }
 
                     /*
-                     * IMS feature configuration over MIPC (0x0a00): the
-                     * stock RIL pushes the same six feature bytes as
-                     * AT+EIMSCFG at boot, well before the PDN activation.
+                     * IMS configuration over MIPC (0x0a00), exactly like
+                     * the stock RIL at boot (captured live 2026-10-14):
+                     * first the "mtk_ct_volte_support"="2" key/value
+                     * pair -- this is what makes the modem request IMS
+                     * voice in the attach; with the AT value "1" VoPS
+                     * stayed 0.  Best effort.
+                     */
+                    {
+                        g_autoptr(GBytes) cfg_request = NULL;
+
+                        cfg_request = mm_mtk_mipc_ims_set_config_kv_request (ctx->slots[i],
+                                                                              MIPC_TXID_IMS_CFG_KV,
+                                                                              "mtk_ct_volte_support",
+                                                                              "2");
+                        if (!cfg_request)
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "cannot build IMS SET_CONFIG kv");
+                        else if (!mipc_exchange (fd, buffer, cfg_request,
+                                                 MM_MTK_MIPC_IMS_SET_CONFIG_CNF,
+                                                 ctx->slots[i], MIPC_TXID_IMS_CFG_KV,
+                                                 MIPC_DATA_TIMEOUT_MS, &frame, &ims_error))
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS SET_CONFIG kv got no CNF: %s",
+                                        ims_error ? ims_error->message : "?");
+                        else
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS SET_CONFIG kv accepted");
+                        mm_mtk_mipc_frame_clear (&frame);
+                    }
+
+                    /*
+                     * Then the six feature bytes as AT+EIMSCFG.
                      * Best effort.
                      */
                     {
@@ -1030,6 +1063,41 @@ connect_thread (GTask        *task,
                             mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
                                         "IMS SET_CONFIG accepted");
                         mm_mtk_mipc_frame_clear (&frame);
+                    }
+
+                    /*
+                     * WFC configuration (0x0b06), exactly what the stock
+                     * RIL sends right before the modem starts its IMS
+                     * stack (captured live 2026-10-14).  Best effort.
+                     */
+                    {
+                        static const struct {
+                            guint16 kind;
+                            guint8  value;
+                            guint16 txid;
+                        } wfc[] = {
+                            { 0x0100, 1, MIPC_TXID_WFC_ENABLE },
+                            { 0x0101, 2, MIPC_TXID_WFC_PREF   },
+                        };
+                        guint wi;
+
+                        for (wi = 0; wi < G_N_ELEMENTS (wfc); wi++) {
+                            g_autoptr(GBytes) wfc_request = NULL;
+
+                            wfc_request = mm_mtk_mipc_wfc_cfg_request (ctx->slots[i],
+                                                                       wfc[wi].txid,
+                                                                       wfc[wi].kind,
+                                                                       wfc[wi].value);
+                            if (wfc_request &&
+                                mipc_exchange (fd, buffer, wfc_request,
+                                               MM_MTK_MIPC_WFC_CFG_CNF,
+                                               ctx->slots[i], wfc[wi].txid,
+                                               MIPC_DATA_TIMEOUT_MS, &frame, &ims_error))
+                                mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                            "WFC cfg 0x%04x=%u accepted",
+                                            wfc[wi].kind, wfc[wi].value);
+                            mm_mtk_mipc_frame_clear (&frame);
+                        }
                     }
 
                     /*

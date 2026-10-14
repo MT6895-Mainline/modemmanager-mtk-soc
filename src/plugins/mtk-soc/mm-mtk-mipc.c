@@ -379,6 +379,36 @@ mm_mtk_mipc_ims_set_config_request (guint8 ps, guint16 transaction_id)
 }
 
 GBytes *
+mm_mtk_mipc_wfc_cfg_request (guint8 ps, guint16 transaction_id,
+                             guint16 kind, guint8 value)
+{
+    g_autoptr(GByteArray) payload = g_byte_array_new ();
+
+    append_tlv (payload, kind, &value, sizeof (value));
+    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_WFC_CFG_REQ, ps,
+                                    transaction_id, payload->data, payload->len);
+}
+
+GBytes *
+mm_mtk_mipc_ims_set_config_kv_request (guint8       ps,
+                                      guint16      transaction_id,
+                                      const gchar *key,
+                                      const gchar *value)
+{
+    g_autoptr(GByteArray) payload = g_byte_array_new ();
+    guint8 mode[4];
+
+    /* Captured live from the stock RIL (TXID=0120, 2026-10-14). */
+    write_u32 (mode, 1);
+    append_tlv (payload, 0x0104, mode, sizeof (mode));
+    append_tlv (payload, 0x0101, (const guint8 *) key, strlen (key) + 1);
+    append_tlv (payload, 0x0201, (const guint8 *) value, strlen (value));
+
+    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_IMS_SET_CONFIG_REQ, ps,
+                                    transaction_id, payload->data, payload->len);
+}
+
+GBytes *
 mm_mtk_mipc_data_ims_reuse_request (guint8 ps, guint16 transaction_id)
 {
     g_autoptr(GByteArray) payload = g_byte_array_new ();

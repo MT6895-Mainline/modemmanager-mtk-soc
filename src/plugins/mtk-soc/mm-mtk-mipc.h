@@ -207,6 +207,28 @@ GBytes *mm_mtk_mipc_ims_pdn_activate_request (guint8  ps,
 GBytes *mm_mtk_mipc_ims_set_config_request (guint8  ps,
                                             guint16 transaction_id);
 
+/* IMS_SET_CONFIG_REQ (0x0a00) with a key/value pair, exactly like the
+ * stock RIL sends "mtk_ct_volte_support"="2" at boot: TLV 0x0104
+ * (u32 = 1), TLV 0x0101 (key + NUL), TLV 0x0201 (value, no NUL).
+ * Without this value 2 the network answers VoPS=0 and the modem never
+ * starts IMS registration. */
+GBytes *mm_mtk_mipc_ims_set_config_kv_request (guint8       ps,
+                                               guint16      transaction_id,
+                                               const gchar *key,
+                                               const gchar *value);
+
+/* WFC_CFG_REQ (0x0b06) / WFC_CFG_CNF (0x0b07): the stock RIL sends
+ * "{TLV 0x0100 = 1}" (WFC enable) right before the modem starts its
+ * IMS stack and "{TLV 0x0101 = 2}" (preference) right after the
+ * registration.  Captured live 2026-10-14. */
+#define MM_MTK_MIPC_WFC_CFG_REQ 0x0b06
+#define MM_MTK_MIPC_WFC_CFG_CNF 0x0b07
+
+GBytes *mm_mtk_mipc_wfc_cfg_request (guint8  ps,
+                                     guint16 transaction_id,
+                                     guint16 kind,
+                                     guint8  value);
+
 /* Stock IMS early-exit frame: APN_TYPE=IMS, REUSE_ONLY, DNN="ims".
  * Does not carry a new APN profile or default-data credentials. */
 GBytes *mm_mtk_mipc_data_ims_reuse_request (guint8 ps, guint16 transaction_id);

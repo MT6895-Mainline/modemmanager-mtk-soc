@@ -1342,20 +1342,17 @@ mtk_soc_ims_config_next (MMBroadbandModemMtkSoc *self,
                          guint                    attempts_left)
 {
     static const gchar *const steps[] = {
-        /* Full IMS enable sequence, byte-for-byte from the stock RIL
-         * (libmtk-ril.so) AT templates.  Order matters: the VoLTE
-         * support flag and the voice-domain preference first, then the
-         * IMS enable, the dedicated IMS PDN switch and the IMS APN
-         * profile, and finally the reporting configuration.  Without
-         * AT+EIMS=1 the modem never creates its internal IMS PDN
-         * state, and without AT+CEVDP the network does not grant
-         * VoPS. */
-        "AT+ECFGSET=\"mtk_ct_volte_support\",\"1\"",
-        "AT+CEVDP=4",
-        "AT+EIMS=1",
-        "AT+EIMSPDN=\"onoff\",1",
-        "AT+EAPNSET=\"ims\",1,\"\",\"\"",
-        "AT+EAPNSET=\"ims\",2,\"type=ims;protocol=IPV4V6;roaming_protocol=IPV4V6;authtype=0;carrier_enabled=1;max_conns=0;max_conns_time=0;wait_time=0;bearer_bitmask=0;inactive_timer=0\"",
+        /* Exactly the sequence the stock RIL sends at boot, captured live
+         * from the stock ROM on 2026-10-14 (radio log, unmasked):
+         *   AT+ECFGSET=mtk_ct_volte_support,2   VoLTE support mode (2!)
+         *   AT+EIMSCFG=3,3,0,0,1,1              IMS feature configuration
+         *   AT+CIREG=2                          IMS registration reporting
+         *   AT+EIMSRCS=0,0                      IMS response codes
+         * The stock stack sends nothing else.  The older list carried
+         * CEVDP/EIMS/EIMSPDN/EAPNSET (RIL templates, never sent live) and
+         * used ECFGSET value 1, which made the network answer VoPS=0 on
+         * every boot -- value 2 is the one that grants IMS voice. */
+        "AT+ECFGSET=\"mtk_ct_volte_support\",\"2\"",
         "AT+EIMSCFG=3,3,0,0,1,1",
         "AT+CIREG=2",
         "AT+EIMSRCS=0,0",

@@ -1351,7 +1351,7 @@ mtk_soc_ims_config_next (MMBroadbandModemMtkSoc *self,
          * state, and without AT+CEVDP the network does not grant
          * VoPS. */
         "AT+ECFGSET=\"mtk_ct_volte_support\",\"1\"",
-        "AT+CEVDP=1",
+        "AT+CEVDP=4",
         "AT+EIMS=1",
         "AT+EIMSPDN=\"onoff\",1",
         "AT+EAPNSET=\"ims\",1,\"\",\"\"",

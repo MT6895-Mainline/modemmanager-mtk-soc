@@ -362,6 +362,23 @@ mm_mtk_mipc_ims_pdn_activate_request (guint8 ps, guint16 transaction_id)
 }
 
 GBytes *
+mm_mtk_mipc_ims_set_config_request (guint8 ps, guint16 transaction_id)
+{
+    g_autoptr(GByteArray) payload = g_byte_array_new ();
+    const guint8 zero[4] = { 0 };
+    const guint8 features[6] = { 3, 3, 0, 0, 1, 1 };
+
+    /* Stock frame: TLV 0x0100 (u32 = 0) first, then the six feature
+     * bytes (same values as AT+EIMSCFG=3,3,0,0,1,1) in TLV 0x0102.
+     * The modem answers with IMS_SET_CONFIG_CNF (0x0a01). */
+    append_tlv (payload, 0x0100, zero, sizeof (zero));
+    append_tlv (payload, 0x0102, features, sizeof (features));
+
+    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_IMS_SET_CONFIG_REQ, ps,
+                                    transaction_id, payload->data, payload->len);
+}
+
+GBytes *
 mm_mtk_mipc_data_ims_reuse_request (guint8 ps, guint16 transaction_id)
 {
     g_autoptr(GByteArray) payload = g_byte_array_new ();

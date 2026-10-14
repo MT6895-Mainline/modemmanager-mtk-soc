@@ -196,6 +196,17 @@ GBytes *mm_mtk_mipc_ims_retry_timer_request (guint8  ps,
 GBytes *mm_mtk_mipc_ims_pdn_activate_request (guint8  ps,
                                               guint16 transaction_id);
 
+/* IMS feature configuration over MIPC (IMS_SET_CONFIG_REQ 0x0a00 /
+ * IMS_SET_CONFIG_CNF 0x0a01): the stock RIL pushes the same six feature
+ * bytes as AT+EIMSCFG ({3,3,0,0,1,1}) at boot, in addition to the AT
+ * command.  Payload: TLV 0x0100 (u32 = 0), then TLV 0x0102 with the six
+ * bytes.  Captured from the stock RIL on 2026-10-07 (TXID=0158). */
+#define MM_MTK_MIPC_IMS_SET_CONFIG_REQ 0x0a00
+#define MM_MTK_MIPC_IMS_SET_CONFIG_CNF 0x0a01
+
+GBytes *mm_mtk_mipc_ims_set_config_request (guint8  ps,
+                                            guint16 transaction_id);
+
 /* Stock IMS early-exit frame: APN_TYPE=IMS, REUSE_ONLY, DNN="ims".
  * Does not carry a new APN profile or default-data credentials. */
 GBytes *mm_mtk_mipc_data_ims_reuse_request (guint8 ps, guint16 transaction_id);

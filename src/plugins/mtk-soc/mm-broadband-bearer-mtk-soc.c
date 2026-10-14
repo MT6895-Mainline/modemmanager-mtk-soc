@@ -39,6 +39,7 @@
  * the default-data one. */
 #define MIPC_TXID_IMS_ACT           0x00e0
 #define MIPC_TXID_IMS_RETRY_TIMER   0x00df
+#define MIPC_TXID_IMS_CFG           0x00e1
 #define MIPC_TXID_DATA_ACT_RETRY 5
 #define MIPC_TXID_REGIND       16
 #define MIPC_TEST_TIMEOUT_MS   3000
@@ -1005,23 +1006,50 @@ connect_thread (GTask        *task,
                     }
 
                     /*
-                     * Use the FULL frame here, not the minimal four-TLV one.
-                     * Measured on this modem: the minimal frame is answered with
-                     * 0x150102 (the "nothing to reuse" refusal, same code the
-                     * REUSE_ONLY variant gets) and a 312-byte CNF carrying no IP
-                     * parameters at all, while the full frame returns a CNF with
-                     * the interface and the modem emits "+EIF: <id>, ifup, ...".
-                     * Now that 0x021b goes out first, this is the combination
-                     * that has not been tried yet.
+                     * IMS feature configuration over MIPC (0x0a00): the
+                     * stock RIL pushes the same six feature bytes as
+                     * AT+EIMSCFG at boot, well before the PDN activation.
+                     * Best effort.
                      */
-                    /* Test: full "create" frame (12 TLVs, APN=ims, type=2),
-                     * now combined with the byte-exact 0x021b and the fixed
-                     * URSP (desc[414] no longer 0xff). */
-                    ims_request = mm_mtk_mipc_data_act_request_typed (ctx->slots[i],
-                                                                      MIPC_TXID_IMS_ACT,
-                                                                      "ims", NULL, NULL,
-                                                                      2 /* APN_TYPE_IMS */,
-                                                                      0, &ims_error);
+                    {
+                        g_autoptr(GBytes) cfg_request = NULL;
+
+                        cfg_request = mm_mtk_mipc_ims_set_config_request (ctx->slots[i],
+                                                                           MIPC_TXID_IMS_CFG);
+                        if (!cfg_request)
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "cannot build IMS SET_CONFIG");
+                        else if (!mipc_exchange (fd, buffer, cfg_request,
+                                                 MM_MTK_MIPC_IMS_SET_CONFIG_CNF,
+                                                 ctx->slots[i], MIPC_TXID_IMS_CFG,
+                                                 MIPC_DATA_TIMEOUT_MS, &frame, &ims_error))
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS SET_CONFIG got no CNF: %s",
+                                        ims_error ? ims_error->message : "?");
+                        else
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS SET_CONFIG accepted");
+                        mm_mtk_mipc_frame_clear (&frame);
+                    }
+
+                    /*
+                     * Stock order: 0x021b DATA_RETRY_TIMER first, then the
+                     * minimal DATA_ACT.  Measured 2026-10-07: with the IMS
+                     * PDN not yet set up the minimal frame is answered with
+                     * 0x150102 ("nothing to reuse") and a 312-byte CNF with
+                     * no IP parameters; with the modem-created PDN in place
+                     * it returns the full IP-parameter CNF (stock: 704 bytes)
+                     * and the SIP registration starts right after.
+                     */
+                    /* Minimal four-TLV frame, exactly what the stock stack
+                     * sends once the modem has set up the IMS PDN (0x4a03):
+                     * TLV 0x010F = 1, TLV 0x0102 = 2 (APN type IMS),
+                     * TLV 0x010A = 3 and the 672-byte URSP descriptor with
+                     * the "ims" DNN.  The full twelve-TLV "create profile"
+                     * frame is accepted with result=0 but does not finalize
+                     * the PDN. */
+                    ims_request = mm_mtk_mipc_ims_pdn_activate_request (ctx->slots[i],
+                                                                        MIPC_TXID_IMS_ACT);
                     if (ims_request) {
                         gsize _rl = 0;
                         const guint8 *_rd = g_bytes_get_data (ims_request, &_rl);

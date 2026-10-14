@@ -229,6 +229,30 @@ GBytes *mm_mtk_mipc_wfc_cfg_request (guint8  ps,
                                      guint16 kind,
                                      guint8  value);
 
+/* APN_SET_PROFILE_STATUS_REQ (0x010b) / CNF (0x010c): the stock RIL
+ * sends {TLV 0x0101 = 1} at boot (captured live 2026-10-14). */
+#define MM_MTK_MIPC_APN_SET_PROFILE_STATUS_REQ 0x010b
+#define MM_MTK_MIPC_APN_SET_PROFILE_STATUS_CNF 0x010c
+
+GBytes *mm_mtk_mipc_apn_set_profile_status_request (guint8  ps,
+                                                    guint16 transaction_id,
+                                                    guint8  status);
+
+/* IMS_GET_CONFIG_REQ (0x0a02) / CNF (0x0a03) key/value form, exactly
+ * what the stock RIL sends before the IMS_SET_CONFIG: TLV 0x0104
+ * (u32 = 1) + TLV 0x0101 (key + NUL). */
+GBytes *mm_mtk_mipc_ims_get_config_kv_request (guint8       ps,
+                                               guint16      transaction_id,
+                                               const gchar *key);
+
+/* IMS_GET_STATE_REQ (0x0a04) / CNF (0x0a05): the stock RIL polls the
+ * IMS state with {TLV 0x0100 = 0}. */
+#define MM_MTK_MIPC_IMS_GET_STATE_REQ 0x0a04
+#define MM_MTK_MIPC_IMS_GET_STATE_CNF 0x0a05
+
+GBytes *mm_mtk_mipc_ims_get_state_request (guint8  ps,
+                                           guint16 transaction_id);
+
 /* Stock IMS early-exit frame: APN_TYPE=IMS, REUSE_ONLY, DNN="ims".
  * Does not carry a new APN profile or default-data credentials. */
 GBytes *mm_mtk_mipc_data_ims_reuse_request (guint8 ps, guint16 transaction_id);

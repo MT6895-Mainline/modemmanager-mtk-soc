@@ -390,6 +390,46 @@ mm_mtk_mipc_wfc_cfg_request (guint8 ps, guint16 transaction_id,
 }
 
 GBytes *
+mm_mtk_mipc_apn_set_profile_status_request (guint8 ps, guint16 transaction_id,
+                                            guint8 status)
+{
+    g_autoptr(GByteArray) payload = g_byte_array_new ();
+
+    /* Captured live from the stock RIL (TXID=0113, 2026-10-14). */
+    append_tlv (payload, 0x0101, &status, sizeof (status));
+    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_APN_SET_PROFILE_STATUS_REQ, ps,
+                                    transaction_id, payload->data, payload->len);
+}
+
+GBytes *
+mm_mtk_mipc_ims_get_config_kv_request (guint8       ps,
+                                       guint16      transaction_id,
+                                       const gchar *key)
+{
+    g_autoptr(GByteArray) payload = g_byte_array_new ();
+    guint8 mode[4];
+
+    /* Same TLV layout as the SET (0x0100, u32 = 1), byte-exact from
+     * the stock capture. */
+    write_u32 (mode, 1);
+    append_tlv (payload, 0x0100, mode, sizeof (mode));
+    append_tlv (payload, 0x0101, (const guint8 *) key, strlen (key) + 1);
+    return mm_mtk_mipc_frame_build (0x0a02, ps, transaction_id,
+                                    payload->data, payload->len);
+}
+
+GBytes *
+mm_mtk_mipc_ims_get_state_request (guint8 ps, guint16 transaction_id)
+{
+    g_autoptr(GByteArray) payload = g_byte_array_new ();
+    const guint8 event = 0;
+
+    append_tlv (payload, 0x0100, &event, sizeof (event));
+    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_IMS_GET_STATE_REQ, ps,
+                                    transaction_id, payload->data, payload->len);
+}
+
+GBytes *
 mm_mtk_mipc_ims_set_config_kv_request (guint8       ps,
                                       guint16      transaction_id,
                                       const gchar *key,
@@ -398,9 +438,11 @@ mm_mtk_mipc_ims_set_config_kv_request (guint8       ps,
     g_autoptr(GByteArray) payload = g_byte_array_new ();
     guint8 mode[4];
 
-    /* Captured live from the stock RIL (TXID=0120, 2026-10-14). */
+    /* Captured live from the stock RIL (TXID=0120, 2026-10-14):
+     * TLV 0x0100 (u32 = 1) + key + value.  NOT 0x0104: the modem
+     * answers that form with result=2 and ignores the write. */
     write_u32 (mode, 1);
-    append_tlv (payload, 0x0104, mode, sizeof (mode));
+    append_tlv (payload, 0x0100, mode, sizeof (mode));
     append_tlv (payload, 0x0101, (const guint8 *) key, strlen (key) + 1);
     append_tlv (payload, 0x0201, (const guint8 *) value, strlen (value));
 

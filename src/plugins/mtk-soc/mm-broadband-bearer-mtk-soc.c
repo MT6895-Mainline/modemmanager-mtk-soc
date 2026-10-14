@@ -44,6 +44,9 @@
 #define MIPC_TXID_WFC_ENABLE        0x00e3
 #define MIPC_TXID_WFC_PREF          0x00e4
 #define MIPC_TXID_IMS_STATE         0x00e5
+#define MIPC_TXID_APN_PROFSTAT      0x00e6
+#define MIPC_TXID_IMS_GETCFG        0x00e7
+#define MIPC_TXID_IMS_POLL          0x00e8
 #define MIPC_TXID_DATA_ACT_RETRY 5
 #define MIPC_TXID_REGIND       16
 #define MIPC_TEST_TIMEOUT_MS   3000
@@ -1010,6 +1013,26 @@ connect_thread (GTask        *task,
                     }
 
                     /*
+                     * APN profile status (0x010b {0x0101=1}), sent by the
+                     * stock RIL at boot.  Best effort.
+                     */
+                    {
+                        g_autoptr(GBytes) prof_request = NULL;
+
+                        prof_request = mm_mtk_mipc_apn_set_profile_status_request (ctx->slots[i],
+                                                                                   MIPC_TXID_APN_PROFSTAT,
+                                                                                   1);
+                        if (prof_request &&
+                            mipc_exchange (fd, buffer, prof_request,
+                                           MM_MTK_MIPC_APN_SET_PROFILE_STATUS_CNF,
+                                           ctx->slots[i], MIPC_TXID_APN_PROFSTAT,
+                                           MIPC_DATA_TIMEOUT_MS, &frame, &ims_error))
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "APN profile status accepted");
+                        mm_mtk_mipc_frame_clear (&frame);
+                    }
+
+                    /*
                      * IMS configuration over MIPC (0x0a00), exactly like
                      * the stock RIL at boot (captured live 2026-10-14):
                      * first the "mtk_ct_volte_support"="2" key/value
@@ -1037,6 +1060,26 @@ connect_thread (GTask        *task,
                         else
                             mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
                                         "IMS SET_CONFIG kv accepted");
+                        mm_mtk_mipc_frame_clear (&frame);
+                    }
+
+                    /*
+                     * The paired IMS_GET_CONFIG (0x0a02, "user_agent")
+                     * the stock RIL sends right before the feature set.
+                     * Best effort, result only logged.
+                     */
+                    {
+                        g_autoptr(GBytes) get_request = NULL;
+
+                        get_request = mm_mtk_mipc_ims_get_config_kv_request (ctx->slots[i],
+                                                                              MIPC_TXID_IMS_GETCFG,
+                                                                              "user_agent");
+                        if (get_request &&
+                            mipc_exchange (fd, buffer, get_request, 0x0a03,
+                                           ctx->slots[i], MIPC_TXID_IMS_GETCFG,
+                                           MIPC_DATA_TIMEOUT_MS, &frame, &ims_error))
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS GET_CONFIG user_agent answered");
                         mm_mtk_mipc_frame_clear (&frame);
                     }
 
@@ -1096,6 +1139,27 @@ connect_thread (GTask        *task,
                                 mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
                                             "WFC cfg 0x%04x=%u accepted",
                                             wfc[wi].kind, wfc[wi].value);
+                            mm_mtk_mipc_frame_clear (&frame);
+                        }
+                    }
+
+                    /*
+                     * IMS state polls (0x0a04 {0x0100=0}) like the stock
+                     * RIL.  Best effort.
+                     */
+                    {
+                        guint pi;
+
+                        for (pi = 0; pi < 4; pi++) {
+                            g_autoptr(GBytes) poll_request = NULL;
+
+                            poll_request = mm_mtk_mipc_ims_get_state_request (ctx->slots[i],
+                                                                               MIPC_TXID_IMS_POLL + pi);
+                            if (poll_request)
+                                mipc_exchange (fd, buffer, poll_request,
+                                               MM_MTK_MIPC_IMS_GET_STATE_CNF,
+                                               ctx->slots[i], MIPC_TXID_IMS_POLL + pi,
+                                               MIPC_DATA_TIMEOUT_MS, &frame, &ims_error);
                             mm_mtk_mipc_frame_clear (&frame);
                         }
                     }

@@ -1284,14 +1284,9 @@ typedef struct {
     guint                   attempts_left;
 } MtkSocCgsmsContext;
 
-/* IMS bring-up, mirroring what Android's RIL does at boot (captured from the
- * stock ROM on 2026-10-07):
- *   AT+EIMSCFG=3,3,0,0,1,1   IMS feature configuration
- *   AT+CIREG=2               enable IMS registration reporting
- *   AT+EIMSRCS=0,0           IMS registration/response code setting
- * All three are accepted by the MD.  They are only half of the picture -- the
- * IMS PDN has to exist as well, which the bearer creates -- but without them
- * the modem never even tries to register.  Sent once, best effort. */
+/* IMS bring-up, mirroring what Android's RIL does at boot (captured from
+ * the stock ROM on 2026-10-07 and from the RIL AT templates on 2026-10-14):
+ * the full enable sequence is sent, then initialization is released. */
 #define MTK_SOC_IMS_CONFIG_ATTEMPTS 4
 #define MTK_SOC_IMS_CONFIG_DELAY_S  5
 
@@ -1303,7 +1298,18 @@ mtk_soc_ims_config_next (MMBroadbandModemMtkSoc *self,
 static void
 mtk_soc_ims_config_done (MMBroadbandModemMtkSoc *self)
 {
+    MtkSocInitializationStartedContext *ctx;
+
     mm_obj_dbg (self, "IMS configuration sequence finished");
+
+    /* Initialization is parked until the full IMS configuration has
+     * been sent, so NetworkManager cannot connect (and the bearer
+     * cannot activate the IMS PDN) before the modem knows about IMS. */
+    ctx = g_object_get_data (G_OBJECT (self), "mtk-soc-init-ctx");
+    if (ctx) {
+        g_object_set_data (G_OBJECT (self), "mtk-soc-init-ctx", NULL);
+        continue_initialization_with_parent (MM_BROADBAND_MODEM (self), ctx);
+    }
 }
 
 static void
@@ -1319,10 +1325,13 @@ mtk_soc_ims_config_ready (MMBaseModem  *self,
     if (!mm_base_modem_at_command_finish (self, res, &error)) {
         mm_obj_dbg (self, "IMS AT step %u failed: %s", index,
                     error ? error->message : "?");
-        if (attempts_left > 0)
+        if (attempts_left > 0) {
             mtk_soc_ims_config_next (MM_BROADBAND_MODEM_MTK_SOC (self), index,
                                      attempts_left - 1);
-        return;
+            return;
+        }
+        /* Best effort: skip a step that keeps failing and continue. */
+        mtk_soc_ims_config_next (MM_BROADBAND_MODEM_MTK_SOC (self), index + 1, 0);
     }
     mtk_soc_ims_config_next (MM_BROADBAND_MODEM_MTK_SOC (self), index + 1, 0);
 }
@@ -1333,6 +1342,20 @@ mtk_soc_ims_config_next (MMBroadbandModemMtkSoc *self,
                          guint                    attempts_left)
 {
     static const gchar *const steps[] = {
+        /* Full IMS enable sequence, byte-for-byte from the stock RIL
+         * (libmtk-ril.so) AT templates.  Order matters: the VoLTE
+         * support flag and the voice-domain preference first, then the
+         * IMS enable, the dedicated IMS PDN switch and the IMS APN
+         * profile, and finally the reporting configuration.  Without
+         * AT+EIMS=1 the modem never creates its internal IMS PDN
+         * state, and without AT+CEVDP the network does not grant
+         * VoPS. */
+        "AT+ECFGSET=\"mtk_ct_volte_support\",\"1\"",
+        "AT+CEVDP=1",
+        "AT+EIMS=1",
+        "AT+EIMSPDN=\"onoff\",1",
+        "AT+EAPNSET=\"ims\",1,\"\",\"\"",
+        "AT+EAPNSET=\"ims\",2,\"type=ims;protocol=IPV4V6;roaming_protocol=IPV4V6;authtype=0;carrier_enabled=1;max_conns=0;max_conns_time=0;wait_time=0;bearer_bitmask=0;inactive_timer=0\"",
         "AT+EIMSCFG=3,3,0,0,1,1",
         "AT+CIREG=2",
         "AT+EIMSRCS=0,0",
@@ -1393,6 +1416,9 @@ cgsms_ready (MMBaseModem *self,
         mm_obj_dbg (cgsms->self,
                     "couldn't select the preferred SMS bearer after %u attempts: %s",
                     (guint) MTK_SOC_CGSMS_ATTEMPTS, error->message);
+        /* Best effort: still run the IMS sequence; it unparks the
+         * initialization when it finishes. */
+        mtk_soc_ims_config_start (cgsms->self);
         cgsms_finished (cgsms);
         return;
     }
@@ -1431,8 +1457,11 @@ static void
 set_cgsms_and_continue (MMBroadbandModemMtkSoc *self,
                         MtkSocInitializationStartedContext *ctx)
 {
+    /* Park the initialization context: the parent initialization only
+     * continues after +CGSMS and the full IMS AT sequence have been
+     * sent (see mtk_soc_ims_config_done). */
+    g_object_set_data (G_OBJECT (self), "mtk-soc-init-ctx", ctx);
     select_preferred_sms_bearer (self);
-    continue_initialization_with_parent (MM_BROADBAND_MODEM (self), ctx);
 }
 
 /* Bring up every reported SIM slot (dual SIM dual standby).

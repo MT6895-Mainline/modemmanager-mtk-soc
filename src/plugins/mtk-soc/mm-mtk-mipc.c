@@ -315,7 +315,8 @@ append_ursp_descriptor (GByteArray  *payload,
     desc[1] = (guint8) len;
     if (len)
         memcpy (desc + 4, apn, len);
-    desc[414] = 0xff;
+    /* Stock frames (captured 2026-10-10) keep the descriptor all-zero
+     * beyond desc[1] and the DNN; do not set desc[414]. */
     append_tlv (payload, MIPC_TLV_URSP_DESC, desc, MM_MTK_MIPC_URSP_DESC_SIZE);
     g_free (desc);
 }
@@ -324,16 +325,18 @@ GBytes *
 mm_mtk_mipc_ims_retry_timer_request (guint8 ps, guint16 transaction_id)
 {
     g_autoptr(GByteArray) payload = g_byte_array_new ();
+    guint8 action = 1;
     guint8 apn[4] = { 'i', 'm', 's', 0 };
 
     /*
      * The stock stack sends this immediately before the IMS DATA_ACT, with the
-     * APN name in TLV 0x0104.  Without it the modem answers the activation with
+     * action in TLV 0x0100 and the APN name in TLV 0x0101.  Without it the modem answers the activation with
      * result TLV 0x0126 = 2 and no IP parameters at all (312-byte CNF instead of
      * the 704-byte one that carries address/mask/MTU/DNS/interface id), and the
      * IMS PDN never comes up -- so no 4a03, no SIP REGISTER, no +CIREGU.
      */
-    append_tlv (payload, 0x0104, apn, sizeof (apn));
+    append_tlv (payload, 0x0100, &action, sizeof (action));
+    append_tlv (payload, 0x0101, apn, sizeof (apn));
 
     return mm_mtk_mipc_frame_build (MM_MTK_MIPC_DATA_RETRY_TIMER_REQ, ps,
                                     transaction_id, payload->data, payload->len);

@@ -956,7 +956,11 @@ connect_thread (GTask        *task,
                  * variant is refused (0x150102) because there is nothing to
                  * reuse yet.  Best effort: a refusal must not fail the data
                  * call. */
-                {
+                /* Gated: set QQC_MIPC_IMS_ACTIVATE=1 in the ModemManager
+                 * environment to run the IMS PDN activation deliberately.
+                 * Default off while the IMS path is still being brought up,
+                 * so a normal boot never pokes it. */
+                if (g_strcmp0 (g_getenv ("QQC_MIPC_IMS_ACTIVATE"), "1") == 0) {
                     g_autoptr(GBytes)   ims_request = NULL;
                     g_autoptr(GError)   ims_error = NULL;
                     MMMtkMipcDataActCnf ims_cnf;
@@ -983,6 +987,16 @@ connect_thread (GTask        *task,
                                                                             MIPC_TXID_IMS_RETRY_TIMER);
                         if (timer_request)
                             timer_data = g_bytes_get_data (timer_request, &timer_len);
+                        if (timer_data && timer_len > 0) {
+                            g_autofree gchar *thex = g_malloc0 (timer_len * 2 + 1);
+                            gsize tk;
+
+                            for (tk = 0; tk < timer_len; tk++)
+                                g_snprintf (thex + tk * 2, 3, "%02x", timer_data[tk]);
+                            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                        "IMS DATA_RETRY_TIMER REQ len=%u hex=%s",
+                                        (guint) timer_len, thex);
+                        }
                         if (timer_data && timer_len > 0 &&
                             write (fd, timer_data, timer_len) != (ssize_t) timer_len)
                             mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
@@ -1000,11 +1014,25 @@ connect_thread (GTask        *task,
                      * Now that 0x021b goes out first, this is the combination
                      * that has not been tried yet.
                      */
+                    /* Test: full "create" frame (12 TLVs, APN=ims, type=2),
+                     * now combined with the byte-exact 0x021b and the fixed
+                     * URSP (desc[414] no longer 0xff). */
                     ims_request = mm_mtk_mipc_data_act_request_typed (ctx->slots[i],
-                                                                     MIPC_TXID_IMS_ACT,
-                                                                     "ims", NULL, NULL,
-                                                                     2 /* APN_TYPE_IMS */,
-                                                                     0, &ims_error);
+                                                                      MIPC_TXID_IMS_ACT,
+                                                                      "ims", NULL, NULL,
+                                                                      2 /* APN_TYPE_IMS */,
+                                                                      0, &ims_error);
+                    if (ims_request) {
+                        gsize _rl = 0;
+                        const guint8 *_rd = g_bytes_get_data (ims_request, &_rl);
+                        g_autofree gchar *_rhex = g_malloc0 (_rl * 2 + 1);
+                        gsize _k;
+
+                        for (_k = 0; _k < _rl; _k++)
+                            g_snprintf (_rhex + _k * 2, 3, "%02x", _rd[_k]);
+                        mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                    "IMS DATA_ACT REQ len=%u hex=%s", (guint) _rl, _rhex);
+                    }
                     if (!ims_request) {
                         mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
                                     "cannot build IMS DATA_ACT: %s",
@@ -1046,9 +1074,20 @@ connect_thread (GTask        *task,
                                         "IMS DATA_ACT CNF len=%u (no result TLV) hex=%s",
                                         (guint) raw_len, hex);
                     } else if (ims_cnf.result != 0) {
+                        const guint8 *rraw = NULL;
+                        gsize rraw_len = 0;
+                        g_autofree gchar *rhex = NULL;
+                        gsize rn, rk;
+
+                        if (frame.payload)
+                            rraw = g_bytes_get_data (frame.payload, &rraw_len);
+                        rn = MIN (rraw_len, (gsize) 200);
+                        rhex = g_malloc0 (rn * 2 + 1);
+                        for (rk = 0; rk < rn; rk++)
+                            g_snprintf (rhex + rk * 2, 3, "%02x", rraw[rk]);
                         mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
-                                    "IMS DATA_ACT on SIM slot %u refused with result %u",
-                                    ctx->slots[i], ims_cnf.result);
+                                    "IMS DATA_ACT on SIM slot %u refused with result %u cnf_len=%u hex=%s",
+                                    ctx->slots[i], ims_cnf.result, (guint) rraw_len, rhex);
                     } else {
                         mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
                                     "IMS bearer up on SIM slot %u (call id %u, iface %u)",

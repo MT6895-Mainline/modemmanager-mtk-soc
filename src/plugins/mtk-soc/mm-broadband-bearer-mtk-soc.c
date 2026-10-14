@@ -893,6 +893,26 @@ mipc_handshake (gint            fd,
     return TRUE;
 }
 
+/* Log the first bytes of a frame payload (diagnostics). */
+static void
+log_frame_hex (gpointer      source_object,
+               const gchar  *what,
+               GBytes       *payload)
+{
+    const guint8 *d = NULL;
+    gsize         n = 0;
+    g_autofree gchar *hex = NULL;
+    gsize         i;
+
+    if (payload)
+        d = g_bytes_get_data (payload, &n);
+    n = MIN (n, (gsize) 80);
+    hex = g_malloc0 (n * 2 + 1);
+    for (i = 0; i < n; i++)
+        g_snprintf (hex + i * 2, 3, "%02x", d[i]);
+    mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object), "%s hex=%s", what, hex);
+}
+
 static void
 connect_thread (GTask        *task,
                 gpointer      source_object,
@@ -1077,11 +1097,14 @@ connect_thread (GTask        *task,
                         if (get_request &&
                             mipc_exchange (fd, buffer, get_request, 0x0a03,
                                            ctx->slots[i], MIPC_TXID_IMS_GETCFG,
-                                           MIPC_DATA_TIMEOUT_MS, &frame, &ims_error))
+                                           MIPC_DATA_TIMEOUT_MS, &frame, &ims_error)) {
                             mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
                                         "IMS GET_CONFIG user_agent answered");
+                            log_frame_hex (source_object, "GET user_agent cnf", frame.payload);
+                        }
                         mm_mtk_mipc_frame_clear (&frame);
                     }
+
 
                     /*
                      * Then the six feature bytes as AT+EIMSCFG.

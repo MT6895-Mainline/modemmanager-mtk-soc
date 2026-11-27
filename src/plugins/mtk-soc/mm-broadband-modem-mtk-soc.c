@@ -639,10 +639,29 @@ iface_modem_init (MMIfaceModemInterface *iface)
 /* 6th and 7th fields divided by 4 as the LTE/NR RSRQ and RSRP in dB.  We use  */
 /* the same fields and MM's MM_RSRP_TO_QUALITY macro for the percentage.       */
 
+/* yuechu's MD answers with 10-field lines instead: <sig1>,<sig2>,<rssi_qdbm>,
+ * <rscp_qdbm>,<ecn0_qdbm>,<rsrq_qdb>,<rsrp_qdbm>,<act>,<sig3>,<band>, one per
+ * RAT, where only the serving RAT carries real values, e.g. on LTE
+ *   +ECSQ: 12,55,-288,1,1,-56,-344,4096,-3,8      (act 0x1000, RSRP -86 dBm)
+ * and on GSM/EDGE
+ *   +ECSQ: 42,0,-276,1,1,1,1,1,32767,2            (act 0x0001, RSSI -69 dBm)
+ * next to sentinel lines (RSRP 32767 or -512) for NR and C2K. The 13-field
+ * check therefore never matched and the quality stayed 0%. Pick the serving
+ * line by its values and use RSRP for LTE/NR and RSSI otherwise. */
+#define ECSQ_ACT_LTE 0x1000
+#define ECSQ_ACT_NR  0x8000
+
 static gboolean
-parse_ecsq_rsrp (const gchar *response,
-                 gint        *out_rsrp,
-                 gint        *out_rsrq)
+ecsq_value_valid (gint raw)
+{
+    return raw < 0 && raw != -512 && raw != 32767;
+}
+
+static gboolean
+parse_ecsq_quality (const gchar *response,
+                    guint       *out_quality,
+                    gint        *out_dbm,
+                    gboolean    *out_is_rsrp)
 {
     g_auto(GStrv) lines = NULL;
     guint i;
@@ -652,7 +671,7 @@ parse_ecsq_rsrp (const gchar *response,
         g_autofree gchar *line = g_strdup (g_strstrip (lines[i]));
         g_auto(GStrv) fields = NULL;
         guint n;
-        gint rsrq_raw, rsrp_raw;
+        gint rssi_raw, rsrq_raw, rsrp_raw, act;
 
         if (!g_str_has_prefix (line, "+ECSQ: "))
             continue;
@@ -660,18 +679,29 @@ parse_ecsq_rsrp (const gchar *response,
         fields = g_strsplit (line + strlen ("+ECSQ: "), ",", -1);
         for (n = 0; fields[n]; n++)
             ;
-        /* The serving-RAT line carries all 13 fields; shorter lines are for
-         * RATs the modem is not using and have sentinel values. */
-        if (n < 13)
+        if (n < 8)
             continue;
-        if (!mm_get_int_from_str (g_strstrip (fields[5]), &rsrq_raw) ||
-            !mm_get_int_from_str (g_strstrip (fields[6]), &rsrp_raw))
-            continue;
-        if (rsrp_raw == 32767 || rsrp_raw == -512 || rsrp_raw == 0)
+        if (!mm_get_int_from_str (g_strstrip (fields[2]), &rssi_raw) ||
+            !mm_get_int_from_str (g_strstrip (fields[5]), &rsrq_raw) ||
+            !mm_get_int_from_str (g_strstrip (fields[6]), &rsrp_raw) ||
+            !mm_get_int_from_str (g_strstrip (fields[7]), &act))
             continue;
 
-        *out_rsrp = rsrp_raw / 4;
-        *out_rsrq = rsrq_raw / 4;
+        /* 13 fields: the qqcandy serving line, RSRP in the 7th field. */
+        if (n >= 13 || (act & (ECSQ_ACT_LTE | ECSQ_ACT_NR))) {
+            if (!ecsq_value_valid (rsrp_raw) || rsrp_raw == 0)
+                continue;
+            *out_dbm = rsrp_raw / 4;
+            *out_is_rsrp = TRUE;
+            *out_quality = MM_RSRP_TO_QUALITY (*out_dbm);
+            return TRUE;
+        }
+
+        if (!ecsq_value_valid (rssi_raw))
+            continue;
+        *out_dbm = rssi_raw / 4;
+        *out_is_rsrp = FALSE;
+        *out_quality = MM_RSSI_TO_QUALITY (*out_dbm);
         return TRUE;
     }
     return FALSE;
@@ -692,8 +722,9 @@ ecsq_ready (MMBaseModem  *self,
 {
     g_autoptr(GError) error = NULL;
     const gchar      *response;
-    gint              rsrp = 0;
-    gint              rsrq = 0;
+    guint             quality = 0;
+    gint              dbm = 0;
+    gboolean          is_rsrp = FALSE;
 
     response = mm_base_modem_at_command_finish (self, res, &error);
     if (!response) {
@@ -703,16 +734,16 @@ ecsq_ready (MMBaseModem  *self,
         return;
     }
 
-    if (!parse_ecsq_rsrp (response, &rsrp, &rsrq)) {
+    if (!parse_ecsq_quality (response, &quality, &dbm, &is_rsrp)) {
         mm_obj_dbg (self, "+ECSQ has no usable serving-RAT line");
         g_task_return_pointer (task, GUINT_TO_POINTER (0), NULL);
         g_object_unref (task);
         return;
     }
 
-    mm_obj_dbg (self, "+ECSQ RSRP %d dBm / RSRQ %d dB -> quality %u%%",
-                rsrp, rsrq, (guint) MM_RSRP_TO_QUALITY (rsrp));
-    g_task_return_pointer (task, GUINT_TO_POINTER (MM_RSRP_TO_QUALITY (rsrp)), NULL);
+    mm_obj_dbg (self, "+ECSQ %s %d dBm -> quality %u%%",
+                is_rsrp ? "RSRP" : "RSSI", dbm, quality);
+    g_task_return_pointer (task, GUINT_TO_POINTER (quality), NULL);
     g_object_unref (task);
 }
 

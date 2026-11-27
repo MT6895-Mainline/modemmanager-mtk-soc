@@ -36,6 +36,12 @@
 #define MIPC_TXID_DATA_DEACT   3
 #define MIPC_TXID_CALL_LIST    4
 #define MIPC_TXID_DATA_ACT_RETRY 5
+#define MIPC_TXID_CALL_INFO    6
+#define MIPC_TXID_CALL_CHECK   7
+/* The connection monitor asks the MD for the data call every other tick
+ * (5 s each); see load_connection_status(). */
+#define MIPC_CALL_CHECK_TICKS  2
+#define MIPC_CALL_CHECK_TIMEOUT_MS 2000
 #define MIPC_TXID_REGIND       16
 #define MIPC_TEST_TIMEOUT_MS   3000
 #define MIPC_OPEN_TIMEOUT_MS   3000
@@ -53,6 +59,9 @@ struct _MMBroadbandBearerMtkSocPrivate {
     /* Kept open while the data call is up, so disconnect can send DATA_DEACT. */
     gint        fd;
     guint8      slot;
+    /* MIPC id of the data call, for the connection monitor. */
+    guint8      call_id;
+    guint       monitor_ticks;
     GMutex      mutex;
     /* Poll callbacks drain INDs on the baseline path. The optional SPI service
      * also uses fd readiness because the modem's allocation deadline is 5s.
@@ -634,9 +643,46 @@ typedef struct {
     GByteArray         *pending;
 } MtkSocConnectResult;
 
+/* TRUE when cid carries the IMS PDN (APN "ims", reported by the MD as
+ * "ims.MNC<mnc>.MCC<mcc>.GPRS"). Unknown cids count as not IMS. */
+static gboolean
+mipc_call_is_ims (gint        fd,
+                  GByteArray *buffer,
+                  guint8      slot,
+                  guint8      cid)
+{
+    /* DATA_GET_CALL_REQ (0x0205), TLV 0x0101 = u8 call id. */
+    guint8            payload[] = { 0x01, 0x01, 0x01, 0x00, 0, 0, 0, 0 };
+    g_autoptr(GBytes) request = NULL;
+    g_autoptr(GError) error = NULL;
+    MMMtkMipcFrame    frame = { 0 };
+    const guint8     *apn = NULL;
+    guint16           apn_len = 0;
+    gboolean          ims = FALSE;
+
+    payload[4] = cid;
+    request = mm_mtk_mipc_frame_build (0x0205, slot, MIPC_TXID_CALL_INFO, payload, sizeof (payload));
+    if (!mipc_exchange (fd, buffer, request, 0x0206, slot, MIPC_TXID_CALL_INFO,
+                        MIPC_DEACT_TIMEOUT_MS, &frame, &error))
+        return FALSE;
+    if (mm_mtk_mipc_find_tlv (frame.payload, 0x0101, &apn, &apn_len, NULL) &&
+        apn_len >= 3 && g_ascii_strncasecmp ((const gchar *) apn, "ims", 3) == 0 &&
+        (apn_len == 3 || apn[3] == '.' || apn[3] == '\0'))
+        ims = TRUE;
+    mm_mtk_mipc_frame_clear (&frame);
+    return ims;
+}
+
 /* A data call left up by a previous session makes the D2 layer refuse a new
  * DATA_ACT with D2CPM_IN_USE (0x001416D7). Ask the modem which cids are still
  * active and deactivate them, so the following DATA_ACT attempt can succeed.
+ *
+ * The IMS PDN is left alone: it is brought up separately (the MD only
+ * registers IMS once the AP has requested it), and a forced local release of
+ * it leaves the MD unable to register IMS again on that slot until it is
+ * re-attached. Every ModemManager restart hit this, since the previous
+ * session's default bearer is still up: VoLTE on the data SIM dropped while
+ * the other slot kept it.
  * Device-measured contract (run18): the request needs ps = slot (ps = 0xff is
  * refused with result 21); the CNF's 0x0100 byte array is indexed by the call
  * id itself (an accepted DATA_ACT whose CNF ID is 1 shows entry[1]; index 0 is
@@ -676,6 +722,11 @@ mipc_clear_active_calls (gpointer     source_object,
 
         if (!states[i])
             continue;
+        if (mipc_call_is_ims (fd, buffer, slot, (guint8) i)) {
+            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                        "keeping IMS data call cid %u on SIM slot %u", i, slot);
+            continue;
+        }
 
         deact = mm_mtk_mipc_data_deact_request (slot, MIPC_TXID_DATA_DEACT, (guint8) i,
                                                 MM_MTK_MIPC_DEACT_REASON_FORCE_TO_LOCAL_RELEASE,
@@ -1084,6 +1135,8 @@ connect_3gpp_finish (MMBroadbandBearer *self,
     g_mutex_lock (&priv->mutex);
     priv->fd = mtk->fd;
     priv->slot = mtk->slot;
+    priv->call_id = mtk->cnf.call_id;
+    priv->monitor_ticks = 0;
     g_clear_pointer (&priv->ind_buffer, g_byte_array_unref);
     priv->ind_buffer = g_steal_pointer (&mtk->pending);
     g_mutex_unlock (&priv->mutex);
@@ -1305,30 +1358,91 @@ mm_broadband_bearer_mtk_soc_init (MMBroadbandBearerMtkSoc *self)
  * Our bearer knows the truth directly: priv->fd is the MIPC data-call socket and
  * it stays open exactly while the call is up (disconnect and dispose close it and
  * set it to -1).  Answer from that instead of from an AT command this firmware
- * does not implement. */
+ * does not implement.
+ *
+ * The MD can also release the call on its own: a detach, a re-attach, a SIM
+ * swap.  Nothing is reported for that on this channel, and ModemManager and
+ * NetworkManager went on showing a connection whose addresses were dead.  So
+ * every MIPC_CALL_CHECK_TICKS ticks ask the MD for the call by id: once it is
+ * released DATA_GET_CALL fails (result 0x13ffff) and keeps failing after the
+ * next attach.  The channel is then closed and the bearer reported
+ * disconnected, which lets NetworkManager tear the connection down and bring
+ * it up again.  A timeout or transport error proves nothing and is ignored. */
+static gboolean
+mipc_call_released (MMBroadbandBearerMtkSoc        *self,
+                    MMBroadbandBearerMtkSocPrivate *priv)
+{
+    /* DATA_GET_CALL_REQ (0x0205), TLV 0x0101 = u8 call id. */
+    guint8            payload[] = { 0x01, 0x01, 0x01, 0x00, 0, 0, 0, 0 };
+    g_autoptr(GBytes) request = NULL;
+    g_autoptr(GError) error = NULL;
+    MMMtkMipcFrame    frame = { 0 };
+    guint32           result = 0;
+    gboolean          released = FALSE;
+
+    payload[4] = priv->call_id;
+    request = mm_mtk_mipc_frame_build (0x0205, priv->slot, MIPC_TXID_CALL_CHECK,
+                                       payload, sizeof (payload));
+    if (!mipc_exchange (priv->fd, priv->ind_buffer, request, 0x0206, priv->slot,
+                        MIPC_TXID_CALL_CHECK, MIPC_CALL_CHECK_TIMEOUT_MS, &frame, &error)) {
+        mm_obj_dbg (self, "data call check failed: %s", error->message);
+        return FALSE;
+    }
+    if (mm_mtk_mipc_find_u32_tlv (frame.payload, MM_MTK_MIPC_TLV_RESULT, &result, NULL) &&
+        result != 0) {
+        mm_obj_msg (self, "data call %u was released by the modem (result 0x%x)",
+                    priv->call_id, result);
+        released = TRUE;
+    }
+    mm_mtk_mipc_frame_clear (&frame);
+    return released;
+}
+
+static void
+connection_status_thread (GTask        *task,
+                          gpointer      source_object,
+                          gpointer      task_data,
+                          GCancellable *cancellable)
+{
+    MMBroadbandBearerMtkSoc        *self = MM_BROADBAND_BEARER_MTK_SOC (source_object);
+    MMBroadbandBearerMtkSocPrivate *priv;
+    MMBearerConnectionStatus        status = MM_BEARER_CONNECTION_STATUS_DISCONNECTED;
+
+    priv = mm_broadband_bearer_mtk_soc_get_instance_private (self);
+
+    g_mutex_lock (&priv->mutex);
+    if (priv->fd >= 0 && priv->ind_buffer) {
+        status = MM_BEARER_CONNECTION_STATUS_CONNECTED;
+        mipc_drain_unsolicited (priv);
+        if (++priv->monitor_ticks % MIPC_CALL_CHECK_TICKS == 0 &&
+            mipc_call_released (self, priv)) {
+            /* Same teardown as dispose(); there is no call left to deactivate. */
+            mipc_spi_stop_sources (priv);
+            if (priv->ipsec) {
+                mipc_spi_close_client (priv->fd);
+                mm_mtk_ipsec_free (priv->ipsec);
+                priv->ipsec = NULL;
+            }
+            close (priv->fd);
+            priv->fd = -1;
+            status = MM_BEARER_CONNECTION_STATUS_DISCONNECTED;
+        }
+    }
+    g_mutex_unlock (&priv->mutex);
+
+    g_task_return_int (task, (gssize) status);
+}
+
 static void
 load_connection_status (MMBaseBearer        *self,
                         GAsyncReadyCallback  callback,
                         gpointer             user_data)
 {
-    MMBroadbandBearerMtkSoc        *bearer = MM_BROADBAND_BEARER_MTK_SOC (self);
-    MMBroadbandBearerMtkSocPrivate *priv;
-    MMBearerConnectionStatus        status;
-    GTask                          *task;
+    GTask *task;
 
-    priv = mm_broadband_bearer_mtk_soc_get_instance_private (bearer);
-
-    mm_obj_dbg (self, "connection status poll tick (mipc fd=%d)", priv->fd);
-
-    g_mutex_lock (&priv->mutex);
-    if (priv->fd >= 0 && priv->ind_buffer)
-        mipc_drain_unsolicited (priv);
-    status = (priv->fd >= 0) ? MM_BEARER_CONNECTION_STATUS_CONNECTED
-                             : MM_BEARER_CONNECTION_STATUS_DISCONNECTED;
-    g_mutex_unlock (&priv->mutex);
-
+    /* The check waits for the MD, so it runs in a worker like connect. */
     task = g_task_new (self, NULL, callback, user_data);
-    g_task_return_int (task, (gssize) status);
+    g_task_run_in_thread (task, connection_status_thread);
     g_object_unref (task);
 }
 

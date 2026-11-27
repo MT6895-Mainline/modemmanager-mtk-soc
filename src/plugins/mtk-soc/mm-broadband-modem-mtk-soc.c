@@ -933,6 +933,70 @@ set_cgsms_and_continue (MMBroadbandModemMtkSoc *self,
     continue_initialization_with_parent (MM_BROADBAND_MODEM (self), ctx);
 }
 
+/* Let the MD attach on LTE.
+ *
+ * Until the AP configures the initial attach profile and allows data on the
+ * SIM, the MD camps on LTE without attaching (+CEREG stat 0, reject cause 0)
+ * and falls back to GSM/EDGE; measured on yuechu with a CMLink SIM roaming on
+ * Maxis (+COPS act 3 on every boot, LTE-only mode found no service). Stock
+ * Android sends the same three commands on every boot from the MTK RIL data
+ * controller (RmmDcEventHandler::requestSetInitialAttachApn, "AT+EIAREG=1",
+ * "AT+EDALLOW=1"); with them the MD attached on LTE within one +COPS poll.
+ * An empty IA APN lets the network pick the default PDN, as the empty-APN
+ * bearer already does. Errors are ignored: older MDs reject some of these.
+ *
+ * This runs when enabling, not during initialization: initialization may
+ * raise AT+EFUN to power the second slot, and the MD drops an IA APN that
+ * arrives while it reconfigures the radios (still GSM after a clean boot;
+ * the same commands sent once the MD had settled attached on LTE at once).
+ * Stock Android likewise sets it only after the SIM records are loaded.
+ *
+ * Skip it when the MD is already registered on LTE (a ModemManager restart):
+ * re-setting the IA APN makes an attached MD detach and attach again, which
+ * drops the IMS registration (VoLTE) that lives on the old attach. */
+static MMBaseModemAtResponseProcessorResult
+lte_already_registered (MMBaseModem   *self,
+                        gpointer       none,
+                        const gchar   *command,
+                        const gchar   *response,
+                        gboolean       last_command,
+                        const GError  *error,
+                        GVariant     **result,
+                        GError       **result_error)
+{
+    g_auto(GStrv) fields = NULL;
+    const gchar  *value;
+    guint         n;
+    guint         act;
+
+    *result = NULL;
+    *result_error = NULL;
+    /* +COPS: <mode>,<format>,<oper>,<AcT>. +CEREG? cannot be used here: its
+     * reply is taken by the +CEREG unsolicited handler and arrives empty. */
+    value = (!error && response) ? strstr (response, "+COPS:") : NULL;
+    if (value) {
+        fields = g_strsplit (value + strlen ("+COPS:"), ",", -1);
+        n = g_strv_length (fields);
+        if (n >= 4 &&
+            mm_get_uint_from_str (g_strstrip (fields[n - 1]), &act) &&
+            (act == 7 || act == 13)) {
+            mm_obj_info (self, "already registered on LTE/NR, keeping the current attach");
+            return MM_BASE_MODEM_AT_RESPONSE_PROCESSOR_RESULT_SUCCESS;
+        }
+    }
+    mm_obj_info (self, "not on LTE, sending the LTE attach setup (EIAAPN/EIAREG/EDALLOW)");
+    return MM_BASE_MODEM_AT_RESPONSE_PROCESSOR_RESULT_CONTINUE;
+}
+
+static const MMBaseModemAtCommand allow_ps_attach_sequence[] = {
+    { "E0",               3, FALSE, NULL },
+    { "+COPS?",           5, FALSE, lte_already_registered },
+    { "+EIAAPN=\"\",0", 5, FALSE, NULL },
+    { "+EIAREG=1",       5, FALSE, NULL },
+    { "+EDALLOW=1",      5, FALSE, NULL },
+    { NULL }
+};
+
 /* Bring up every reported SIM slot (dual SIM dual standby).
  *
  * The MD comes up with AT+EFUN=0/1, i.e. exactly one slot powered, so the second
@@ -1132,6 +1196,51 @@ initialization_started_finish (MMBroadbandModem *self,
         self, res, error);
 }
 
+/*****************************************************************************/
+/* Enabling: initialize the modem */
+
+static gboolean
+enabling_modem_init_finish (MMBroadbandModem  *self,
+                            GAsyncResult      *res,
+                            GError           **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+allow_ps_attach_ready (MMBaseModem  *self,
+                       GAsyncResult *res,
+                       GTask        *task)
+{
+    g_autoptr(GError)   error = NULL;
+    g_autoptr(GVariant) result = NULL;
+
+    /* With no response processors the sequence yields no result: only the
+     * error says whether it failed. */
+    result = mm_base_modem_at_sequence_finish (self, res, NULL, &error);
+    if (error)
+        mm_obj_dbg (self, "couldn't allow the LTE attach: %s", error->message);
+
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+enabling_modem_init (MMBroadbandModem    *self,
+                     GAsyncReadyCallback  callback,
+                     gpointer             user_data)
+{
+    GTask *task;
+
+    /* No ATZ (the parent's init): it restores the MD's AT defaults, echo
+     * included, and with echo on the +COPS? check below reads the echoed
+     * command instead of the reply. */
+    task = g_task_new (self, NULL, callback, user_data);
+    mm_base_modem_at_sequence (MM_BASE_MODEM (self), allow_ps_attach_sequence,
+                               NULL, NULL,
+                               (GAsyncReadyCallback) allow_ps_attach_ready, task);
+}
+
 MMBroadbandModemMtkSoc *
 mm_broadband_modem_mtk_soc_new (const gchar  *device,
                                 const gchar  *physdev,
@@ -1163,4 +1272,6 @@ mm_broadband_modem_mtk_soc_class_init (MMBroadbandModemMtkSocClass *klass)
 
     broadband_class->initialization_started = initialization_started;
     broadband_class->initialization_started_finish = initialization_started_finish;
+    broadband_class->enabling_modem_init = enabling_modem_init;
+    broadband_class->enabling_modem_init_finish = enabling_modem_init_finish;
 }

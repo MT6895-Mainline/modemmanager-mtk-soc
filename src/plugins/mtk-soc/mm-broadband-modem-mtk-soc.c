@@ -1419,6 +1419,61 @@ modem_voice_load_call_list (MMIfaceModemVoice   *self,
                               (GAsyncReadyCallback) clcc_ready, task);
 }
 
+/*****************************************************************************/
+/* Call waiting (Voice interface)                                             */
+/*                                                                            */
+/* AT+CCWA=1,2 / AT+CCWA=1,<0|1> are supplementary service operations. With   */
+/* no XCAP/Ut configured the MD runs them in the CS domain, i.e. it falls     */
+/* back to GSM and loses the IMS registration: measured on yuechu, GNOME      */
+/* Calls queries call waiting whenever the modem appears, and 0.6 s after     */
+/* +CCWA=1,2 the MD left LTE (+COPS act 7 -> 3) and VoLTE dropped.  Refuse    */
+/* both instead of trading VoLTE for the answer.                              */
+
+static void
+call_waiting_unsupported (MMIfaceModemVoice   *self,
+                          GAsyncReadyCallback  callback,
+                          gpointer             user_data)
+{
+    g_task_report_new_error (self, callback, user_data, call_waiting_unsupported,
+                             MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                             "Call waiting needs supplementary services over IMS, "
+                             "which would fall back to the CS domain");
+}
+
+static void
+modem_voice_call_waiting_setup (MMIfaceModemVoice   *self,
+                                gboolean             enable,
+                                GAsyncReadyCallback  callback,
+                                gpointer             user_data)
+{
+    call_waiting_unsupported (self, callback, user_data);
+}
+
+static gboolean
+modem_voice_call_waiting_setup_finish (MMIfaceModemVoice  *self,
+                                       GAsyncResult       *res,
+                                       GError            **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+modem_voice_call_waiting_query (MMIfaceModemVoice   *self,
+                                GAsyncReadyCallback  callback,
+                                gpointer             user_data)
+{
+    call_waiting_unsupported (self, callback, user_data);
+}
+
+static gboolean
+modem_voice_call_waiting_query_finish (MMIfaceModemVoice  *self,
+                                       GAsyncResult       *res,
+                                       gboolean           *status,
+                                       GError            **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
 /* The MIPC call notification client starts once the voice interface enables
  * its unsolicited events, i.e. when the modem is enabled. */
 static gboolean
@@ -1468,6 +1523,10 @@ iface_modem_voice_init (MMIfaceModemVoiceInterface *iface)
     iface->load_call_list_finish = modem_voice_load_call_list_finish;
     iface->enable_unsolicited_events = modem_voice_enable_unsolicited_events;
     iface->enable_unsolicited_events_finish = modem_voice_enable_unsolicited_events_finish;
+    iface->call_waiting_setup = modem_voice_call_waiting_setup;
+    iface->call_waiting_setup_finish = modem_voice_call_waiting_setup_finish;
+    iface->call_waiting_query = modem_voice_call_waiting_query;
+    iface->call_waiting_query_finish = modem_voice_call_waiting_query_finish;
 }
 
 MMBroadbandModemMtkSoc *

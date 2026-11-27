@@ -12,6 +12,7 @@
  * in a GTask worker thread with poll() deadlines.
  */
 
+#include <arpa/inet.h>
 #include <config.h>
 
 #include <errno.h>
@@ -19,6 +20,11 @@
 #include <poll.h>
 #include <string.h>
 #include <unistd.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <glib-unix.h>
 
 #include "ModemManager.h"
@@ -48,6 +54,11 @@
 #define MIPC_IND_DATA_LOG_BYTES 512
 #define MIPC_TXID_REGSPI       0x70
 #define MIPC_TXID_CLOSE        0x72
+/* IPv6 prefix discovery, see mtk_soc_discover_prefix(). */
+#define RA_SETTLE_MS           700
+#define RA_FIRST_MS            1000
+#define RA_QUIET_MS            300
+#define RA_ROUNDS              3
 
 struct _MMBroadbandBearerMtkSocPrivate {
     /* Kept open while the data call is up, so disconnect can send DATA_DEACT. */
@@ -75,6 +86,208 @@ G_DEFINE_TYPE_WITH_PRIVATE (MMBroadbandBearerMtkSoc, mm_broadband_bearer_mtk_soc
 static void mipc_spi_start (MMBroadbandBearerMtkSoc *self);
 
 /*****************************************************************************/
+/* IPv6 prefix discovery                                                      */
+
+static gboolean
+ipv6_is_link_local (const guint8 *address)
+{
+    return address[0] == 0xfe && (address[1] & 0xc0) == 0x80;
+}
+
+static guint16
+icmp6_checksum (const guint8 *src,
+                const guint8 *dst,
+                const guint8 *icmp,
+                gsize         len)
+{
+    guint32 sum = 0;
+    gsize   i;
+
+    for (i = 0; i < 16; i += 2)
+        sum += ((guint32) src[i] << 8 | src[i + 1]) + ((guint32) dst[i] << 8 | dst[i + 1]);
+    sum += (guint32) len + IPPROTO_ICMPV6;
+    for (i = 0; i + 1 < len; i += 2)
+        sum += (guint32) icmp[i] << 8 | icmp[i + 1];
+    if (len & 1)
+        sum += (guint32) icmp[len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (guint16) ~sum;
+}
+
+/* TRUE when pkt is a Router Advertisement from a link-local router carrying
+ * an autonomous /64 prefix that is still valid. */
+static gboolean
+ra_parse (const guint8 *pkt,
+          gsize         len,
+          guint8       *prefix,
+          guint8       *router)
+{
+    gsize off;
+
+    /* IPv6 header (no extension headers) + RA header. */
+    if (len < 40 + 16 || (pkt[0] >> 4) != 6 || pkt[6] != IPPROTO_ICMPV6 || pkt[7] != 255)
+        return FALSE;
+    if (pkt[40] != 134 || pkt[41] != 0 || !ipv6_is_link_local (pkt + 8))
+        return FALSE;
+
+    for (off = 40 + 16; off + 2 <= len; off += (gsize) pkt[off + 1] * 8) {
+        const guint8 *opt = pkt + off;
+
+        if (opt[1] == 0 || off + (gsize) opt[1] * 8 > len)
+            return FALSE;
+        /* Prefix Information: length 64, autonomous flag, valid lifetime != 0. */
+        if (opt[0] == 3 && opt[1] == 4 && opt[2] == 64 && (opt[3] & 0x40) &&
+            (opt[4] | opt[5] | opt[6] | opt[7])) {
+            memcpy (prefix, opt + 16, 16);
+            memset (prefix + 8, 0, 8);
+            memcpy (router, pkt + 8, 16);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static gboolean
+link_set_up (const gchar *ifname)
+{
+    struct ifreq ifr;
+    gboolean     ok = FALSE;
+    gint         s;
+
+    s = socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (s < 0)
+        return FALSE;
+    memset (&ifr, 0, sizeof (ifr));
+    g_strlcpy (ifr.ifr_name, ifname, sizeof (ifr.ifr_name));
+    if (ioctl (s, SIOCGIFFLAGS, &ifr) == 0) {
+        if (ifr.ifr_flags & IFF_UP)
+            ok = TRUE;
+        else {
+            ifr.ifr_flags |= IFF_UP;
+            ok = ioctl (s, SIOCSIFFLAGS, &ifr) == 0;
+        }
+    }
+    close (s);
+    return ok;
+}
+
+/* Read packets for up to first_ms waiting for a Router Advertisement, then
+ * until quiet_ms pass without another one. The last one read wins. */
+static gboolean
+ra_collect (gint    s,
+            guint   first_ms,
+            guint   quiet_ms,
+            guint8 *prefix,
+            guint8 *router)
+{
+    gboolean found = FALSE;
+    gint64   deadline;
+
+    deadline = g_get_monotonic_time () + (gint64) first_ms * 1000;
+    for (;;) {
+        struct pollfd pfd = { .fd = s, .events = POLLIN };
+        guint8        pkt[1500];
+        gint64        now = g_get_monotonic_time ();
+        gssize        n;
+
+        if (now >= deadline)
+            return found;
+        if (poll (&pfd, 1, (gint) ((deadline - now + 999) / 1000)) < 0) {
+            if (errno == EINTR)
+                continue;
+            return found;
+        }
+        if (!(pfd.revents & POLLIN))
+            continue;
+        n = recv (s, pkt, sizeof (pkt), MSG_DONTWAIT);
+        if (n <= 0)
+            continue;
+        if (ra_parse (pkt, (gsize) n, prefix, router)) {
+            found = TRUE;
+            deadline = g_get_monotonic_time () + (gint64) quiet_ms * 1000;
+        }
+    }
+}
+
+/* The MD of some networks reports only a link-local IPv6 address in
+ * DATA_ACT_CALL_CNF (fe80::1, CelcomDigi) and leaves the prefix to Router
+ * Advertisements; others report the global address itself (Maxis).
+ *
+ * The advertisements cannot be left to the host's SLAAC. When the ccmni link
+ * comes up the MD first delivers the advertisements of data calls it has
+ * already released, with an infinite lifetime, and only then the current one
+ * (seen after every re-attach: up to four prefixes on the interface, one of
+ * them routed). A solicitation sent once that burst is over is answered within
+ * a few ms with the prefix of the current call alone.
+ *
+ * So: bring the link up, let the burst pass, solicit, and take the prefix of
+ * the last advertisement. The solicitation is sent from the unspecified
+ * address over a packet socket, which needs no address on the interface. */
+static gboolean
+mtk_soc_discover_prefix (const gchar  *ifname,
+                         guint8       *prefix,
+                         guint8       *router,
+                         const gchar **failure)
+{
+    static const guint8 all_routers[16] = { 0xff, 0x02, [15] = 0x02 };
+    struct sockaddr_ll  sll;
+    guint8              rs[40 + 8];
+    guint8              scratch[16];
+    gboolean            found = FALSE;
+    guint               round;
+    guint16             csum;
+    gint                s;
+
+    memset (&sll, 0, sizeof (sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = g_htons (ETH_P_IPV6);
+    sll.sll_ifindex = (gint) if_nametoindex (ifname);
+    *failure = "no such interface";
+    if (sll.sll_ifindex == 0)
+        return FALSE;
+
+    s = socket (AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, g_htons (ETH_P_IPV6));
+    if (s < 0 || bind (s, (struct sockaddr *) &sll, sizeof (sll)) < 0 || !link_set_up (ifname)) {
+        *failure = g_strerror (errno);
+        if (s >= 0)
+            close (s);
+        return FALSE;
+    }
+
+    /* Router Solicitation, :: -> ff02::2, hop limit 255, no options. */
+    memset (rs, 0, sizeof (rs));
+    rs[0] = 0x60;
+    rs[5] = 8;
+    rs[6] = IPPROTO_ICMPV6;
+    rs[7] = 255;
+    memcpy (rs + 24, all_routers, 16);
+    rs[40] = 133;
+    csum = icmp6_checksum (rs + 8, rs + 24, rs + 40, 8);
+    rs[42] = (guint8) (csum >> 8);
+    rs[43] = (guint8) csum;
+
+    /* Let the advertisements of released calls go by. */
+    ra_collect (s, RA_SETTLE_MS, RA_SETTLE_MS, scratch, scratch);
+
+    *failure = "no answer to the router solicitation";
+    for (round = 0; round < RA_ROUNDS && !found; round++) {
+        /* Whoever handled the previous call on this ccmni may still be taking
+         * the link down; put it back up and try again. */
+        if (sendto (s, rs, sizeof (rs), 0, (struct sockaddr *) &sll, sizeof (sll)) < 0) {
+            *failure = g_strerror (errno);
+            g_usleep (RA_QUIET_MS * 1000);
+            link_set_up (ifname);
+            continue;
+        }
+        found = ra_collect (s, RA_FIRST_MS, RA_QUIET_MS, prefix, router);
+    }
+
+    close (s);
+    return found;
+}
+
+/*****************************************************************************/
 /* Blocking MIPC I/O helpers                                                  */
 
 static gchar *
@@ -82,6 +295,20 @@ ipv4_to_string (const guint8 *address)
 {
     return g_strdup_printf ("%u.%u.%u.%u",
                             address[0], address[1], address[2], address[3]);
+}
+
+/* NULL for the unspecified address, so absent TLVs are simply skipped. */
+static gchar *
+ipv6_to_string (const guint8 *address)
+{
+    static const guint8 zero[16] = { 0 };
+    gchar buf[INET6_ADDRSTRLEN];
+
+    if (memcmp (address, zero, sizeof (zero)) == 0)
+        return NULL;
+    if (!inet_ntop (AF_INET6, address, buf, sizeof (buf)))
+        return NULL;
+    return g_strdup (buf);
 }
 
 static gboolean
@@ -632,6 +859,11 @@ typedef struct {
     guint8              slot;
     MMMtkMipcDataActCnf cnf;
     GByteArray         *pending;
+    /* Prefix and router of the Router Advertisement answering our own
+     * solicitation, when the MD only reported a link-local address. */
+    gboolean            has_ra;
+    guint8              ra_prefix[16];
+    guint8              ra_router[16];
 } MtkSocConnectResult;
 
 /* A data call left up by a previous session makes the D2 layer refuse a new
@@ -904,6 +1136,20 @@ connect_thread (GTask        *task,
                 result->cnf = cnf;
                 result->pending = g_steal_pointer (&buffer);
                 fd = -1; /* ownership moved to the result */
+                if (cnf.has_ipv6 && ipv6_is_link_local (cnf.ipv6)) {
+                    g_autofree gchar *ifname = NULL;
+                    const gchar      *failure = NULL;
+
+                    ifname = g_strdup_printf ("ccmni%u", cnf.interface_id);
+                    result->has_ra = mtk_soc_discover_prefix (ifname,
+                                                              result->ra_prefix,
+                                                              result->ra_router,
+                                                              &failure);
+                    if (!result->has_ra)
+                        mm_obj_warn (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                                     "no IPv6 prefix found on %s (%s), leaving IPv6 to SLAAC",
+                                     ifname, failure);
+                }
                 break;
             }
 
@@ -1010,6 +1256,12 @@ connect_3gpp_finish (MMBroadbandBearer *self,
     MMBroadbandBearerMtkSocPrivate *priv;
     MtkSocConnectResult            *mtk;
     MMBearerIpConfig               *ipv4 = NULL;
+    MMBearerIpConfig               *ipv6 = NULL;
+    g_autofree gchar               *address6 = NULL;
+    g_autofree gchar               *gateway6 = NULL;
+    g_autofree gchar               *dns6_1 = NULL;
+    g_autofree gchar               *dns6_2 = NULL;
+    const gchar                    *dns6[3] = { NULL, NULL, NULL };
     MMBearerConnectResult          *result = NULL;
     g_autoptr(MMBaseModem)          modem = NULL;
     g_autoptr(MMPort)               port = NULL;
@@ -1037,9 +1289,10 @@ connect_3gpp_finish (MMBroadbandBearer *self,
     }
 
     address = ipv4_to_string (mtk->cnf.ipv4);
-    if (g_str_equal (address, "0.0.0.0")) {
+    address6 = mtk->cnf.has_ipv6 ? ipv6_to_string (mtk->cnf.ipv6) : NULL;
+    if (g_str_equal (address, "0.0.0.0") && !address6) {
         g_set_error_literal (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_INVALID,
-                             "MIPC DATA_ACT returned no IPv4 address");
+                             "MIPC DATA_ACT returned no IP address");
         goto out;
     }
 
@@ -1061,23 +1314,72 @@ connect_3gpp_finish (MMBroadbandBearer *self,
 
     mtu = mtk->cnf.mtu ? mtk->cnf.mtu : MIPC_DEFAULT_MTU;
 
-    ipv4 = mm_bearer_ip_config_new ();
-    mm_bearer_ip_config_set_method (ipv4, MM_BEARER_IP_METHOD_STATIC);
-    mm_bearer_ip_config_set_address (ipv4, address);
-    mm_bearer_ip_config_set_prefix (ipv4, mtk->cnf.ipv4_prefix);
-    gateway = ipv4_to_string (mtk->cnf.gateway);
-    if (!g_str_equal (gateway, "0.0.0.0"))
-        mm_bearer_ip_config_set_gateway (ipv4, gateway);
-    dns1 = ipv4_to_string (mtk->cnf.dns[0]);
-    dns2 = ipv4_to_string (mtk->cnf.dns[1]);
-    if (!g_str_equal (dns1, "0.0.0.0"))
-        dns[0] = dns1;
-    if (!g_str_equal (dns2, "0.0.0.0"))
-        dns[1] = dns2;
-    mm_bearer_ip_config_set_dns (ipv4, dns);
-    mm_bearer_ip_config_set_mtu (ipv4, mtu);
+    /* An IPv6-only call has no IPv4 half. */
+    if (!g_str_equal (address, "0.0.0.0")) {
+        ipv4 = mm_bearer_ip_config_new ();
+        mm_bearer_ip_config_set_method (ipv4, MM_BEARER_IP_METHOD_STATIC);
+        mm_bearer_ip_config_set_address (ipv4, address);
+        mm_bearer_ip_config_set_prefix (ipv4, mtk->cnf.ipv4_prefix);
+        gateway = ipv4_to_string (mtk->cnf.gateway);
+        if (!g_str_equal (gateway, "0.0.0.0"))
+            mm_bearer_ip_config_set_gateway (ipv4, gateway);
+        dns1 = ipv4_to_string (mtk->cnf.dns[0]);
+        dns2 = ipv4_to_string (mtk->cnf.dns[1]);
+        if (!g_str_equal (dns1, "0.0.0.0"))
+            dns[0] = dns1;
+        if (!g_str_equal (dns2, "0.0.0.0"))
+            dns[dns[0] ? 1 : 0] = dns2;
+        mm_bearer_ip_config_set_dns (ipv4, dns);
+        mm_bearer_ip_config_set_mtu (ipv4, mtu);
+    }
 
-    result = mm_bearer_connect_result_new (port, ipv4, NULL);
+    if (address6) {
+        ipv6 = mm_bearer_ip_config_new ();
+        if (!ipv6_is_link_local (mtk->cnf.ipv6)) {
+            /* A global address. The modem reports /128, but the PDN owns the
+             * whole /64 (TS 23.401 5.3.1.2.2) and the gateway sits inside it;
+             * /64 keeps it on-link. */
+            mm_bearer_ip_config_set_method (ipv6, MM_BEARER_IP_METHOD_STATIC);
+            mm_bearer_ip_config_set_address (ipv6, address6);
+            mm_bearer_ip_config_set_prefix (ipv6, (mtk->cnf.ipv6_prefix && mtk->cnf.ipv6_prefix < 64) ?
+                                                  mtk->cnf.ipv6_prefix : 64);
+            gateway6 = ipv6_to_string (mtk->cnf.ipv6_gateway);
+        } else if (mtk->has_ra) {
+            guint8 global[16];
+
+            /* Only the interface identifier came from the modem: join it to
+             * the prefix the network advertised for this call and report the
+             * result as static, so that the host does not run SLAAC over the
+             * stale advertisements described at mtk_soc_discover_prefix(). */
+            memcpy (global, mtk->ra_prefix, 8);
+            memcpy (global + 8, mtk->cnf.ipv6 + 8, 8);
+            g_free (address6);
+            address6 = ipv6_to_string (global);
+            mm_bearer_ip_config_set_method (ipv6, MM_BEARER_IP_METHOD_STATIC);
+            mm_bearer_ip_config_set_address (ipv6, address6);
+            mm_bearer_ip_config_set_prefix (ipv6, 64);
+            gateway6 = ipv6_to_string (mtk->ra_router);
+        } else {
+            /* No advertisement was seen: a link-local address with the DHCP
+             * method asks the host for SLAAC, as the MBIM bearer does. */
+            mm_bearer_ip_config_set_method (ipv6, MM_BEARER_IP_METHOD_DHCP);
+            mm_bearer_ip_config_set_address (ipv6, address6);
+            mm_bearer_ip_config_set_prefix (ipv6, 64);
+            gateway6 = ipv6_to_string (mtk->cnf.ipv6_gateway);
+        }
+        if (gateway6)
+            mm_bearer_ip_config_set_gateway (ipv6, gateway6);
+        dns6_1 = ipv6_to_string (mtk->cnf.dns6[0]);
+        dns6_2 = ipv6_to_string (mtk->cnf.dns6[1]);
+        if (dns6_1)
+            dns6[0] = dns6_1;
+        if (dns6_2)
+            dns6[dns6[0] ? 1 : 0] = dns6_2;
+        mm_bearer_ip_config_set_dns (ipv6, dns6);
+        mm_bearer_ip_config_set_mtu (ipv6, mtu);
+    }
+
+    result = mm_bearer_connect_result_new (port, ipv4, ipv6);
     /* Remember the MIPC call id so disconnect can deactivate it. */
     mm_bearer_connect_result_set_profile_id (result, (gint) mtk->cnf.call_id);
 
@@ -1090,14 +1392,15 @@ connect_3gpp_finish (MMBroadbandBearer *self,
     mtk->fd = -1; /* ownership moved to the private data */
     mipc_spi_start (MM_BROADBAND_BEARER_MTK_SOC (self));
 
-    mm_obj_dbg (self, "connected %s (call id %u, prefix %u, mtu %u)",
+    mm_obj_dbg (self, "connected %s (call id %u, prefix %u, mtu %u, IPv6 %s)",
                 mm_port_get_device (port), mtk->cnf.call_id,
-                mtk->cnf.ipv4_prefix, mtu);
+                mtk->cnf.ipv4_prefix, mtu, address6 ? address6 : "none");
 
 out:
     if (mtk)
         connect_result_free (mtk);
     g_clear_object (&ipv4);
+    g_clear_object (&ipv6);
     return result;
 }
 

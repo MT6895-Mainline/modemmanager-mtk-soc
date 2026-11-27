@@ -94,6 +94,15 @@ static const gchar *cnf_ok_payload =
     "048104000a141e28218104000a141e01280104001d0000000e81040008080808"
     "0f810400010101012301040000000000";
 
+/* cnf_ok_payload plus the IPv6 half of an IPv4v6 call (2001:db8::/32). */
+static const gchar *cnf_ok_v6_payload =
+    "0000040000000000000101000700000025010400030000002a01040067000000"
+    "048104000a141e28218104000a141e01280104001d0000000e81040008080808"
+    "0f810400010101012301040000000000"
+    "0981100020010db80001000200000000000000aa000000002901040080000000"
+    "2281100020010db8000100020000000000000001000000001381100020010db8"
+    "00000000000000000000005300000000";
+
 static const gchar *cnf_err_payload = "0000040006000000";
 
 static gchar *
@@ -377,6 +386,31 @@ test_data_act_cnf_parse (void)
 }
 
 static void
+test_data_act_cnf_ipv6 (void)
+{
+    g_autoptr(GBytes) payload = bytes_from_hex (cnf_ok_v6_payload);
+    g_autoptr(GBytes) v4only = bytes_from_hex (cnf_ok_payload);
+    MMMtkMipcDataActCnf cnf;
+    g_autoptr(GError) error = NULL;
+    static const guint8 zero[16] = { 0 };
+
+    g_assert_true (mm_mtk_mipc_parse_data_act_cnf (payload, &cnf, &error));
+    g_assert_no_error (error);
+    g_assert_true (cnf.has_ipv6);
+    g_assert_cmpuint (cnf.ipv4[3], ==, 40);
+    g_assert_cmpuint (cnf.ipv6[0], ==, 0x20);
+    g_assert_cmpuint (cnf.ipv6[15], ==, 0xaa);
+    g_assert_cmpuint (cnf.ipv6_prefix, ==, 128);
+    g_assert_cmpuint (cnf.ipv6_gateway[15], ==, 0x01);
+    g_assert_cmpuint (cnf.dns6[0][15], ==, 0x53);
+    g_assert_cmpmem (cnf.dns6[1], 16, zero, 16);
+
+    g_assert_true (mm_mtk_mipc_parse_data_act_cnf (v4only, &cnf, &error));
+    g_assert_no_error (error);
+    g_assert_false (cnf.has_ipv6);
+}
+
+static void
 test_data_act_cnf_error (void)
 {
     g_autoptr(GBytes) payload = bytes_from_hex (cnf_err_payload);
@@ -583,6 +617,7 @@ main (int argc, char **argv)
     g_test_add_func ("/mipc/d2cpm-in-use-result", test_in_use_result);
     g_test_add_func ("/mipc/data-act-cnf-parse", test_data_act_cnf_parse);
     g_test_add_func ("/mipc/ims-reuse-frame", test_ims_reuse_frame);
+    g_test_add_func ("/mipc/data-act-cnf-ipv6", test_data_act_cnf_ipv6);
     g_test_add_func ("/mipc/data-act-cnf-error", test_data_act_cnf_error);
     g_test_add_func ("/mipc/spi-register", test_spi_register);
     g_test_add_func ("/mipc/spi-alloc", test_spi_alloc);

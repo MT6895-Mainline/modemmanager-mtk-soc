@@ -641,11 +641,13 @@ parse_u8 (GBytes   *payload,
 }
 
 static gboolean
-parse_bytes4 (GBytes   *payload,
-              guint16   kind,
-              guint8   *value,
-              gboolean  required,
-              GError  **error)
+parse_bytes_n (GBytes   *payload,
+               guint16   kind,
+               guint8   *value,
+               guint16   expected,
+               gboolean  required,
+               gboolean *found_out,
+               GError  **error)
 {
     const guint8 *raw = NULL;
     guint16       len = 0;
@@ -655,14 +657,26 @@ parse_bytes4 (GBytes   *payload,
         return FALSE;
     if (!found)
         return TRUE;
-    if (len != 4) {
+    if (len != expected) {
         g_set_error_literal (error, MM_MTK_MIPC_ERROR,
                              MM_MTK_MIPC_ERROR_INVALID,
                              "Unexpected MIPC TLV value length");
         return FALSE;
     }
-    memcpy (value, raw, 4);
+    memcpy (value, raw, expected);
+    if (found_out)
+        *found_out = TRUE;
     return TRUE;
+}
+
+static gboolean
+parse_bytes4 (GBytes   *payload,
+              guint16   kind,
+              guint8   *value,
+              gboolean  required,
+              GError  **error)
+{
+    return parse_bytes_n (payload, kind, value, 4, required, NULL, error);
 }
 
 gboolean
@@ -701,6 +715,20 @@ mm_mtk_mipc_parse_data_act_cnf (GBytes              *payload,
     if (!parse_bytes4 (payload, MM_MTK_MIPC_TLV_DNS2, cnf->dns[1], FALSE, error))
         return FALSE;
     if (!parse_u32 (payload, MM_MTK_MIPC_TLV_MTU, &cnf->mtu, FALSE, error))
+        return FALSE;
+    if (!parse_bytes_n (payload, MM_MTK_MIPC_TLV_IPV6_ADDRESS, cnf->ipv6, 16,
+                        FALSE, &cnf->has_ipv6, error))
+        return FALSE;
+    if (!cnf->has_ipv6)
+        return TRUE;
+    if (!parse_u32 (payload, MM_MTK_MIPC_TLV_IPV6_PREFIX, &cnf->ipv6_prefix, FALSE, error))
+        return FALSE;
+    if (!parse_bytes_n (payload, MM_MTK_MIPC_TLV_IPV6_GATEWAY, cnf->ipv6_gateway, 16,
+                        FALSE, NULL, error))
+        return FALSE;
+    if (!parse_bytes_n (payload, MM_MTK_MIPC_TLV_DNS6_1, cnf->dns6[0], 16, FALSE, NULL, error))
+        return FALSE;
+    if (!parse_bytes_n (payload, MM_MTK_MIPC_TLV_DNS6_2, cnf->dns6[1], 16, FALSE, NULL, error))
         return FALSE;
     return TRUE;
 }

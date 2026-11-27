@@ -56,6 +56,14 @@ G_BEGIN_DECLS
 #define MM_MTK_MIPC_TLV_IPV4_GATEWAY  0x8121
 #define MM_MTK_MIPC_TLV_DNS1          0x810e
 #define MM_MTK_MIPC_TLV_DNS2          0x810f
+/* IPv6 half of an IPv4v6 (PDP type 3) call, measured on CMLink/Maxis:
+ * 0x8109 address, 0x0129 prefix length (reported as 128), 0x8122 gateway,
+ * 0x8113/0x8114 DNS. All absent on an IPv4-only call. */
+#define MM_MTK_MIPC_TLV_IPV6_ADDRESS  0x8109
+#define MM_MTK_MIPC_TLV_IPV6_PREFIX   0x0129
+#define MM_MTK_MIPC_TLV_IPV6_GATEWAY  0x8122
+#define MM_MTK_MIPC_TLV_DNS6_1        0x8113
+#define MM_MTK_MIPC_TLV_DNS6_2        0x8114
 
 /* Tag 0x0100 is reused per-message. In the 0x202 CNF it is the data call id;
  * in the 0x210 call-list CNF it is a byte array indexed by (cid - 1) whose
@@ -129,6 +137,11 @@ typedef struct {
     guint32 ipv4_prefix;
     guint8  dns[2][4];
     guint32 mtu;
+    gboolean has_ipv6;
+    guint8  ipv6[16];
+    guint8  ipv6_gateway[16];
+    guint32 ipv6_prefix;
+    guint8  dns6[2][16];
 } MMMtkMipcDataActCnf;
 
 void    mm_mtk_mipc_frame_clear (MMMtkMipcFrame *frame);

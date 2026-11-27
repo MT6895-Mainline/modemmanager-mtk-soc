@@ -12,6 +12,7 @@
  * in a GTask worker thread with poll() deadlines.
  */
 
+#include <arpa/inet.h>
 #include <config.h>
 
 #include <errno.h>
@@ -82,6 +83,20 @@ ipv4_to_string (const guint8 *address)
 {
     return g_strdup_printf ("%u.%u.%u.%u",
                             address[0], address[1], address[2], address[3]);
+}
+
+/* NULL for the unspecified address, so absent TLVs are simply skipped. */
+static gchar *
+ipv6_to_string (const guint8 *address)
+{
+    static const guint8 zero[16] = { 0 };
+    gchar buf[INET6_ADDRSTRLEN];
+
+    if (memcmp (address, zero, sizeof (zero)) == 0)
+        return NULL;
+    if (!inet_ntop (AF_INET6, address, buf, sizeof (buf)))
+        return NULL;
+    return g_strdup (buf);
 }
 
 static gboolean
@@ -1010,6 +1025,12 @@ connect_3gpp_finish (MMBroadbandBearer *self,
     MMBroadbandBearerMtkSocPrivate *priv;
     MtkSocConnectResult            *mtk;
     MMBearerIpConfig               *ipv4 = NULL;
+    MMBearerIpConfig               *ipv6 = NULL;
+    g_autofree gchar               *address6 = NULL;
+    g_autofree gchar               *gateway6 = NULL;
+    g_autofree gchar               *dns6_1 = NULL;
+    g_autofree gchar               *dns6_2 = NULL;
+    const gchar                    *dns6[3] = { NULL, NULL, NULL };
     MMBearerConnectResult          *result = NULL;
     g_autoptr(MMBaseModem)          modem = NULL;
     g_autoptr(MMPort)               port = NULL;
@@ -1077,7 +1098,29 @@ connect_3gpp_finish (MMBroadbandBearer *self,
     mm_bearer_ip_config_set_dns (ipv4, dns);
     mm_bearer_ip_config_set_mtu (ipv4, mtu);
 
-    result = mm_bearer_connect_result_new (port, ipv4, NULL);
+    address6 = mtk->cnf.has_ipv6 ? ipv6_to_string (mtk->cnf.ipv6) : NULL;
+    if (address6) {
+        /* The modem reports /128, but the PDN owns the whole /64 (TS 23.401
+         * 5.3.1.2.2) and the gateway sits inside it; /64 keeps it on-link. */
+        ipv6 = mm_bearer_ip_config_new ();
+        mm_bearer_ip_config_set_method (ipv6, MM_BEARER_IP_METHOD_STATIC);
+        mm_bearer_ip_config_set_address (ipv6, address6);
+        mm_bearer_ip_config_set_prefix (ipv6, (mtk->cnf.ipv6_prefix && mtk->cnf.ipv6_prefix < 64) ?
+                                              mtk->cnf.ipv6_prefix : 64);
+        gateway6 = ipv6_to_string (mtk->cnf.ipv6_gateway);
+        if (gateway6)
+            mm_bearer_ip_config_set_gateway (ipv6, gateway6);
+        dns6_1 = ipv6_to_string (mtk->cnf.dns6[0]);
+        dns6_2 = ipv6_to_string (mtk->cnf.dns6[1]);
+        if (dns6_1)
+            dns6[0] = dns6_1;
+        if (dns6_2)
+            dns6[dns6[0] ? 1 : 0] = dns6_2;
+        mm_bearer_ip_config_set_dns (ipv6, dns6);
+        mm_bearer_ip_config_set_mtu (ipv6, mtu);
+    }
+
+    result = mm_bearer_connect_result_new (port, ipv4, ipv6);
     /* Remember the MIPC call id so disconnect can deactivate it. */
     mm_bearer_connect_result_set_profile_id (result, (gint) mtk->cnf.call_id);
 
@@ -1098,6 +1141,7 @@ out:
     if (mtk)
         connect_result_free (mtk);
     g_clear_object (&ipv4);
+    g_clear_object (&ipv6);
     return result;
 }
 

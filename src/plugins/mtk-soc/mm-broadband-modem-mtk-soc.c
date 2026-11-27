@@ -5,7 +5,13 @@
 
 #include <config.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <string.h>
+#include <unistd.h>
+
+#include <glib-unix.h>
 
 #include "ModemManager.h"
 #include "mm-base-modem-at.h"
@@ -14,11 +20,14 @@
 #include "mm-broadband-modem.h"
 #include "mm-broadband-modem-mtk-soc.h"
 #include "mm-iface-modem.h"
+#include "mm-iface-modem-voice.h"
 #include "mm-log-object.h"
 #include "mm-modem-helpers.h"
+#include "mm-mtk-mipc.h"
 #include "mm-port-serial-at.h"
 
 static void iface_modem_init (MMIfaceModemInterface *iface);
+static void iface_modem_voice_init (MMIfaceModemVoiceInterface *iface);
 static void load_signal_quality (MMIfaceModem *self, GAsyncReadyCallback callback, gpointer user_data);
 static guint load_signal_quality_finish (MMIfaceModem *self, GAsyncResult *res, GError **error);
 
@@ -26,7 +35,8 @@ G_DEFINE_TYPE_EXTENDED (MMBroadbandModemMtkSoc,
                         mm_broadband_modem_mtk_soc,
                         MM_TYPE_BROADBAND_MODEM,
                         0,
-                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init))
+                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init)
+                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_VOICE, iface_modem_voice_init))
 
 typedef struct {
     GPtrArray *sim_slots;
@@ -1130,6 +1140,393 @@ initialization_started_finish (MMBroadbandModem *self,
 {
     return MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_mtk_soc_parent_class)->initialization_started_finish (
         self, res, error);
+}
+
+/*****************************************************************************/
+/* Incoming call notification over MIPC                                       */
+/*                                                                            */
+/* The MD reports VoLTE call progress only as MIPC CALL_STATUS_IND (0x4901):  */
+/* no RING, +CRING, +CLIP or +ECPI reaches the AT port, so MM never learns    */
+/* about an incoming call.  Answering and hanging up do work over AT (ATA,    */
+/* AT+CHUP) and +CLCC lists the call, so a dedicated MIPC client only has to  */
+/* turn every CALL_STATUS_IND of the primary slot into a call list reload.    */
+/* Measured on yuechu: setup (msg 0), connected (6) and disconnected (133)    */
+/* each arrive as CALL_STATUS_IND, ATA connects, AT+CHUP releases.            */
+
+#define MIPC_VOICE_PORT          "/dev/ttyCMIPC6"
+#define MIPC_VOICE_DATA          "mm-mtk-soc-voice-watch"
+#define MIPC_CALL_STATUS_IND     0x4901
+#define MIPC_VOICE_TIMEOUT_MS    2000
+#define MIPC_VOICE_RELOAD_MS     300
+
+typedef struct {
+    MMBroadbandModemMtkSoc *self;   /* not a reference: the watch is owned by it */
+    gint                    fd;
+    guint                   source;
+    guint                   reload;
+    GByteArray             *buffer;
+} MtkSocVoiceWatch;
+
+static void
+voice_watch_free (MtkSocVoiceWatch *watch)
+{
+    if (watch->reload)
+        g_source_remove (watch->reload);
+    if (watch->source)
+        g_source_remove (watch->source);
+    if (watch->fd >= 0)
+        close (watch->fd);
+    g_byte_array_unref (watch->buffer);
+    g_free (watch);
+}
+
+/* Blocking request/confirmation on the voice client, only used for the short
+ * TEST/OPEN/register handshake when the watch is created. */
+static gboolean
+voice_watch_exchange (MtkSocVoiceWatch *watch,
+                      GBytes           *request,
+                      guint16           confirmation_id)
+{
+    const guint8 *data;
+    gsize         size;
+    gint64        deadline;
+
+    data = g_bytes_get_data (request, &size);
+    if (write (watch->fd, data, size) != (gssize) size)
+        return FALSE;
+
+    deadline = g_get_monotonic_time () + MIPC_VOICE_TIMEOUT_MS * 1000;
+    while (g_get_monotonic_time () < deadline) {
+        MMMtkMipcFrame frame = { 0 };
+        struct pollfd  pfd = { .fd = watch->fd, .events = POLLIN };
+        guint8         chunk[4096];
+        gssize         n;
+
+        while (mm_mtk_mipc_stream_pop (watch->buffer, &frame)) {
+            gboolean match = (frame.message_id == confirmation_id);
+
+            mm_mtk_mipc_frame_clear (&frame);
+            if (match)
+                return TRUE;
+        }
+        if (poll (&pfd, 1, 100) <= 0)
+            continue;
+        n = read (watch->fd, chunk, sizeof (chunk));
+        if (n > 0)
+            g_byte_array_append (watch->buffer, chunk, (guint) n);
+        else if (n < 0 && errno != EAGAIN && errno != EINTR)
+            return FALSE;
+    }
+    return FALSE;
+}
+
+static void
+voice_reload_ready (MMIfaceModemVoice *self,
+                    GAsyncResult      *res)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (!mm_iface_modem_voice_reload_all_calls_finish (self, res, &error))
+        mm_obj_dbg (self, "couldn't reload calls after CALL_STATUS_IND: %s", error->message);
+}
+
+static gboolean
+voice_reload_cb (MtkSocVoiceWatch *watch)
+{
+    watch->reload = 0;
+    mm_iface_modem_voice_reload_all_calls (MM_IFACE_MODEM_VOICE (watch->self),
+                                           (GAsyncReadyCallback) voice_reload_ready,
+                                           NULL);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean
+voice_watch_readable (gint              fd,
+                      GIOCondition      condition,
+                      MtkSocVoiceWatch *watch)
+{
+    MMMtkMipcFrame frame = { 0 };
+    guint8         chunk[4096];
+    gssize         n;
+
+    if (condition & (G_IO_HUP | G_IO_ERR)) {
+        mm_obj_warn (watch->self, "MIPC voice client closed");
+        watch->source = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    n = read (fd, chunk, sizeof (chunk));
+    if (n > 0)
+        g_byte_array_append (watch->buffer, chunk, (guint) n);
+
+    while (mm_mtk_mipc_stream_pop (watch->buffer, &frame)) {
+        if (frame.message_id == MIPC_CALL_STATUS_IND) {
+            /* A burst of indications (setup, alerting, SIP progress) settles
+             * into one +CLCC reload. */
+            if (!watch->reload)
+                watch->reload = g_timeout_add (MIPC_VOICE_RELOAD_MS,
+                                               (GSourceFunc) voice_reload_cb, watch);
+        }
+        mm_mtk_mipc_frame_clear (&frame);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+voice_watch_start (MMBroadbandModemMtkSoc *self)
+{
+    MtkSocVoiceWatch  *watch;
+    g_autoptr(GBytes)  request = NULL;
+    g_autoptr(GError)  error = NULL;
+    guint              slot;
+
+    if (g_object_get_data (G_OBJECT (self), MIPC_VOICE_DATA))
+        return;
+
+    slot = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (self), MM_MTK_SOC_PRIMARY_SLOT_DATA));
+    if (slot < 1 || slot > 2)
+        slot = 1;
+
+    watch = g_new0 (MtkSocVoiceWatch, 1);
+    watch->self = self;
+    watch->buffer = g_byte_array_new ();
+    watch->fd = open (MIPC_VOICE_PORT, O_RDWR | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+    if (watch->fd < 0) {
+        mm_obj_warn (self, "couldn't open %s for call notifications: %s",
+                     MIPC_VOICE_PORT, g_strerror (errno));
+        voice_watch_free (watch);
+        return;
+    }
+
+    request = mm_mtk_mipc_test_request (0xff, 0x0700);
+    if (!voice_watch_exchange (watch, request, MM_MTK_MIPC_TEST_CNF))
+        goto fail;
+    g_clear_pointer (&request, g_bytes_unref);
+    request = mm_mtk_mipc_open_request (0xff, 0x0701, MIPC_VOICE_PORT, &error);
+    if (!request || !voice_watch_exchange (watch, request, MM_MTK_MIPC_OPEN_CNF))
+        goto fail;
+    g_clear_pointer (&request, g_bytes_unref);
+    request = mm_mtk_mipc_register_ind_request ((guint8) slot, 0x0702, MIPC_CALL_STATUS_IND, &error);
+    if (!request || !voice_watch_exchange (watch, request, MM_MTK_MIPC_REGISTER_IND_CNF))
+        goto fail;
+
+    watch->source = g_unix_fd_add (watch->fd, G_IO_IN | G_IO_HUP | G_IO_ERR,
+                                   (GUnixFDSourceFunc) voice_watch_readable, watch);
+    g_object_set_data_full (G_OBJECT (self), MIPC_VOICE_DATA, watch,
+                            (GDestroyNotify) voice_watch_free);
+    mm_obj_info (self, "listening for incoming calls on SIM slot %u over MIPC", slot);
+    return;
+
+fail:
+    mm_obj_warn (self, "couldn't subscribe to MIPC call status: %s",
+                 error ? error->message : "no confirmation");
+    voice_watch_free (watch);
+}
+
+/*****************************************************************************/
+/* Call list (Voice interface)                                                */
+/*                                                                            */
+/* The MD lists VoLTE calls with the MediaTek IMS voice mode 20, e.g.         */
+/*   +CLCC: 1,1,4,20,0,"+60...",145,,,0                                       */
+/* and mm_3gpp_parse_clcc_response() skips every mode other than 0 as "not a  */
+/* voice call", so an incoming VoLTE call never appeared.  Report mode 20 as  */
+/* voice; IMS video (21) stays skipped.                                       */
+
+static MMIfaceModemVoiceInterface *iface_modem_voice_parent;
+
+static gchar *
+clcc_ims_voice_as_voice (const gchar *response)
+{
+    g_auto(GStrv) lines = NULL;
+    GString      *out;
+    guint         i;
+
+    out = g_string_new (NULL);
+    lines = g_strsplit_set (response, "\r\n", -1);
+    for (i = 0; lines[i]; i++) {
+        g_auto(GStrv) fields = NULL;
+
+        if (!lines[i][0])
+            continue;
+        if (g_str_has_prefix (lines[i], "+CLCC:")) {
+            fields = g_strsplit (lines[i], ",", -1);
+            if (g_strv_length (fields) >= 4 && g_str_equal (g_strstrip (fields[3]), "20")) {
+                g_autofree gchar *joined = NULL;
+
+                g_free (fields[3]);
+                fields[3] = g_strdup ("0");
+                joined = g_strjoinv (",", fields);
+                g_string_append_printf (out, "%s\r\n", joined);
+                continue;
+            }
+        }
+        g_string_append_printf (out, "%s\r\n", lines[i]);
+    }
+    return g_string_free (out, FALSE);
+}
+
+static gboolean
+modem_voice_load_call_list_finish (MMIfaceModemVoice  *self,
+                                   GAsyncResult       *res,
+                                   GList             **out_call_info_list,
+                                   GError            **error)
+{
+    GList  *call_info_list;
+    GError *inner_error = NULL;
+
+    call_info_list = g_task_propagate_pointer (G_TASK (res), &inner_error);
+    if (inner_error) {
+        g_propagate_error (error, inner_error);
+        return FALSE;
+    }
+    *out_call_info_list = call_info_list;
+    return TRUE;
+}
+
+static void
+clcc_ready (MMBaseModem  *self,
+            GAsyncResult *res,
+            GTask        *task)
+{
+    const gchar      *response;
+    g_autofree gchar *rewritten = NULL;
+    GError           *error = NULL;
+    GList            *call_info_list = NULL;
+
+    response = mm_base_modem_at_command_finish (self, res, &error);
+    if (!response) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+    rewritten = clcc_ims_voice_as_voice (response);
+    if (!mm_3gpp_parse_clcc_response (rewritten, self, &call_info_list, &error))
+        g_task_return_error (task, error);
+    else
+        g_task_return_pointer (task, call_info_list, (GDestroyNotify) mm_3gpp_call_info_list_free);
+    g_object_unref (task);
+}
+
+static void
+modem_voice_load_call_list (MMIfaceModemVoice   *self,
+                            GAsyncReadyCallback  callback,
+                            gpointer             user_data)
+{
+    GTask *task;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    mm_base_modem_at_command (MM_BASE_MODEM (self), "+CLCC", 5, FALSE,
+                              (GAsyncReadyCallback) clcc_ready, task);
+}
+
+/*****************************************************************************/
+/* Call waiting (Voice interface)                                             */
+/*                                                                            */
+/* AT+CCWA=1,2 / AT+CCWA=1,<0|1> are supplementary service operations. With   */
+/* no XCAP/Ut configured the MD runs them in the CS domain, i.e. it falls     */
+/* back to GSM and loses the IMS registration: measured on yuechu, GNOME      */
+/* Calls queries call waiting whenever the modem appears, and 0.6 s after     */
+/* +CCWA=1,2 the MD left LTE (+COPS act 7 -> 3) and VoLTE dropped.  Refuse    */
+/* both instead of trading VoLTE for the answer.                              */
+
+static void
+call_waiting_unsupported (MMIfaceModemVoice   *self,
+                          GAsyncReadyCallback  callback,
+                          gpointer             user_data)
+{
+    g_task_report_new_error (self, callback, user_data, call_waiting_unsupported,
+                             MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                             "Call waiting needs supplementary services over IMS, "
+                             "which would fall back to the CS domain");
+}
+
+static void
+modem_voice_call_waiting_setup (MMIfaceModemVoice   *self,
+                                gboolean             enable,
+                                GAsyncReadyCallback  callback,
+                                gpointer             user_data)
+{
+    call_waiting_unsupported (self, callback, user_data);
+}
+
+static gboolean
+modem_voice_call_waiting_setup_finish (MMIfaceModemVoice  *self,
+                                       GAsyncResult       *res,
+                                       GError            **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+modem_voice_call_waiting_query (MMIfaceModemVoice   *self,
+                                GAsyncReadyCallback  callback,
+                                gpointer             user_data)
+{
+    call_waiting_unsupported (self, callback, user_data);
+}
+
+static gboolean
+modem_voice_call_waiting_query_finish (MMIfaceModemVoice  *self,
+                                       GAsyncResult       *res,
+                                       gboolean           *status,
+                                       GError            **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+/* The MIPC call notification client starts once the voice interface enables
+ * its unsolicited events, i.e. when the modem is enabled. */
+static gboolean
+modem_voice_enable_unsolicited_events_finish (MMIfaceModemVoice  *self,
+                                              GAsyncResult       *res,
+                                              GError            **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+parent_voice_enable_unsolicited_events_ready (MMIfaceModemVoice *self,
+                                              GAsyncResult      *res,
+                                              GTask             *task)
+{
+    GError *error = NULL;
+
+    if (!iface_modem_voice_parent->enable_unsolicited_events_finish (self, res, &error)) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    voice_watch_start (MM_BROADBAND_MODEM_MTK_SOC (self));
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+modem_voice_enable_unsolicited_events (MMIfaceModemVoice   *self,
+                                       GAsyncReadyCallback  callback,
+                                       gpointer             user_data)
+{
+    GTask *task;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    iface_modem_voice_parent->enable_unsolicited_events (
+        self, (GAsyncReadyCallback) parent_voice_enable_unsolicited_events_ready, task);
+}
+
+static void
+iface_modem_voice_init (MMIfaceModemVoiceInterface *iface)
+{
+    iface_modem_voice_parent = g_type_interface_peek_parent (iface);
+
+    iface->load_call_list = modem_voice_load_call_list;
+    iface->load_call_list_finish = modem_voice_load_call_list_finish;
+    iface->enable_unsolicited_events = modem_voice_enable_unsolicited_events;
+    iface->enable_unsolicited_events_finish = modem_voice_enable_unsolicited_events_finish;
+    iface->call_waiting_setup = modem_voice_call_waiting_setup;
+    iface->call_waiting_setup_finish = modem_voice_call_waiting_setup_finish;
+    iface->call_waiting_query = modem_voice_call_waiting_query;
+    iface->call_waiting_query_finish = modem_voice_call_waiting_query_finish;
 }
 
 MMBroadbandModemMtkSoc *

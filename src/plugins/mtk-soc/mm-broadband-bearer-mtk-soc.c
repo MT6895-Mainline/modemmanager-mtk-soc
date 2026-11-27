@@ -36,6 +36,7 @@
 #define MIPC_TXID_DATA_DEACT   3
 #define MIPC_TXID_CALL_LIST    4
 #define MIPC_TXID_DATA_ACT_RETRY 5
+#define MIPC_TXID_CALL_INFO    6
 #define MIPC_TXID_REGIND       16
 #define MIPC_TEST_TIMEOUT_MS   3000
 #define MIPC_OPEN_TIMEOUT_MS   3000
@@ -634,9 +635,46 @@ typedef struct {
     GByteArray         *pending;
 } MtkSocConnectResult;
 
+/* TRUE when cid carries the IMS PDN (APN "ims", reported by the MD as
+ * "ims.MNC<mnc>.MCC<mcc>.GPRS"). Unknown cids count as not IMS. */
+static gboolean
+mipc_call_is_ims (gint        fd,
+                  GByteArray *buffer,
+                  guint8      slot,
+                  guint8      cid)
+{
+    /* DATA_GET_CALL_REQ (0x0205), TLV 0x0101 = u8 call id. */
+    guint8            payload[] = { 0x01, 0x01, 0x01, 0x00, 0, 0, 0, 0 };
+    g_autoptr(GBytes) request = NULL;
+    g_autoptr(GError) error = NULL;
+    MMMtkMipcFrame    frame = { 0 };
+    const guint8     *apn = NULL;
+    guint16           apn_len = 0;
+    gboolean          ims = FALSE;
+
+    payload[4] = cid;
+    request = mm_mtk_mipc_frame_build (0x0205, slot, MIPC_TXID_CALL_INFO, payload, sizeof (payload));
+    if (!mipc_exchange (fd, buffer, request, 0x0206, slot, MIPC_TXID_CALL_INFO,
+                        MIPC_DEACT_TIMEOUT_MS, &frame, &error))
+        return FALSE;
+    if (mm_mtk_mipc_find_tlv (frame.payload, 0x0101, &apn, &apn_len, NULL) &&
+        apn_len >= 3 && g_ascii_strncasecmp ((const gchar *) apn, "ims", 3) == 0 &&
+        (apn_len == 3 || apn[3] == '.' || apn[3] == '\0'))
+        ims = TRUE;
+    mm_mtk_mipc_frame_clear (&frame);
+    return ims;
+}
+
 /* A data call left up by a previous session makes the D2 layer refuse a new
  * DATA_ACT with D2CPM_IN_USE (0x001416D7). Ask the modem which cids are still
  * active and deactivate them, so the following DATA_ACT attempt can succeed.
+ *
+ * The IMS PDN is left alone: it is brought up separately (the MD only
+ * registers IMS once the AP has requested it), and a forced local release of
+ * it leaves the MD unable to register IMS again on that slot until it is
+ * re-attached. Every ModemManager restart hit this, since the previous
+ * session's default bearer is still up: VoLTE on the data SIM dropped while
+ * the other slot kept it.
  * Device-measured contract (run18): the request needs ps = slot (ps = 0xff is
  * refused with result 21); the CNF's 0x0100 byte array is indexed by the call
  * id itself (an accepted DATA_ACT whose CNF ID is 1 shows entry[1]; index 0 is
@@ -676,6 +714,11 @@ mipc_clear_active_calls (gpointer     source_object,
 
         if (!states[i])
             continue;
+        if (mipc_call_is_ims (fd, buffer, slot, (guint8) i)) {
+            mm_obj_dbg (MM_BROADBAND_BEARER_MTK_SOC (source_object),
+                        "keeping IMS data call cid %u on SIM slot %u", i, slot);
+            continue;
+        }
 
         deact = mm_mtk_mipc_data_deact_request (slot, MIPC_TXID_DATA_DEACT, (guint8) i,
                                                 MM_MTK_MIPC_DEACT_REASON_FORCE_TO_LOCAL_RELEASE,
